@@ -29,7 +29,7 @@ An intimate room acoustic with soft, diffuse reverberation; quiet, even dynamics
   blank: { title: "", duration: 32, prompt: "" }
 };
 
-const labels = { queued: "任务已排队", submitting: "正在提交到 Stability…", generating: "音乐正在生成…", saving: "正在保存音频…", completed: "已完成", failed: "未完成" };
+const labels = { queued: "任务已排队", preparing: "正在截取 A/B 并拼接参考…", assembling: "正在接回参考音频并处理接缝…", submitting: "正在提交到 Stability…", generating: "音乐正在生成…", saving: "正在保存音频…", completed: "已完成", failed: "未完成" };
 let loopInstructions = "";
 let keyConfigured = false;
 let allJobs = [];
@@ -39,6 +39,7 @@ let submitting = false;
 let timer = null;
 let selectedJob = null;
 let processingLoop = false;
+let audioSources = [];
 
 function stored(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
 function save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* Private browsing may disable storage. */ } }
@@ -68,6 +69,8 @@ function updateButton() {
   const busy = submitting || Boolean(activeId);
   $("generate-button").disabled = !keyConfigured || busy;
   $("generate-button").textContent = busy ? "Generating…" : "Generate music ↗";
+  $("bridge-button").disabled = !keyConfigured || busy || audioSources.length < 2;
+  $("bridge-button").textContent = busy ? "Generating…" : "Generate transition ↗";
 }
 async function api(path, options = {}) {
   const response = await fetch(path, { cache: "no-store", ...options });
@@ -114,6 +117,7 @@ function selectJob(job) {
   $("job-progress").hidden = completed || failed;
   $("job-error").hidden = !failed;
   $("result").hidden = !completed;
+  $("bridge-result").hidden = !completed || job.kind !== "bridge";
   $("output-badge").textContent = completed ? "READY TO LISTEN" : failed ? "PLEASE CHECK" : "IN PROGRESS";
   $("job-error").textContent = job.error || "本次生成未完成。";
   if (!completed) $("audio").pause();
@@ -127,8 +131,14 @@ function selectJob(job) {
       audio.src = job.audio_url;
       audio.load();
     }
+    if (changed) $("preview-loop").checked = job.kind !== "bridge";
     audio.loop = $("preview-loop").checked;
     $("download").href = `${job.audio_url}?download=true`;
+    if (job.kind === "bridge" && job.transition_report) {
+      const report = job.transition_report;
+      $("bridge-report").textContent = `完整连接段 ${report.duration.toFixed(2)} 秒 · 中间段 ${report.bridge_seconds.toFixed(2)} 秒 · 每端 ${Math.round(report.seam_overlap_seconds * 1000)}ms 淡化。${report.warnings.join(" ")}`;
+      $("download-bridge").href = `${job.bridge_url}?download=true`;
+    }
   } else if (!failed) {
     $("progress-title").textContent = labels[job.status] || "正在生成…";
     updateElapsed();
@@ -241,6 +251,7 @@ $("process-loop").addEventListener("click", async () => {
       $("loop-status").textContent = "处理完成。点击「从接缝前开始试听」检查连接处，也可以对比原始文件。";
     }
     renderHistory();
+    await loadSources();
   } catch (error) {
     if (selectedId === job.id) $("loop-status").textContent = `处理未完成：${error.message}`;
   } finally {
@@ -264,7 +275,10 @@ async function poll() {
     networkNote("");
     upsert(job);
     if (selectedId === job.id) selectJob(job);
-    if (["completed", "failed"].includes(job.status)) activeId = null;
+    if (["completed", "failed"].includes(job.status)) {
+      activeId = null;
+      if (job.status === "completed") loadSources();
+    }
     renderHistory();
   } catch {
     networkNote("暂时无法读取任务状态，正在重新连接。请勿重复提交生成请求。");
@@ -323,7 +337,113 @@ $("clear-prompt").addEventListener("click", () => { $("prompt").value = ""; refr
 $("preview-loop").addEventListener("change", () => { $("audio").loop = $("preview-loop").checked; });
 $("audio").addEventListener("error", () => { if ($("audio").getAttribute("src")) networkNote("音频无法加载或浏览器不支持该文件，请尝试下载后播放。"); });
 $("reuse").addEventListener("click", () => {
-  if (selectedJob) { applyForm(selectedJob); $("prompt").focus(); $("generation-form").scrollIntoView({ behavior: "smooth", block: "start" }); }
+  if (selectedJob?.kind === "bridge") {
+    $("source-a").value = selectedJob.source_a;
+    $("source-b").value = selectedJob.source_b;
+    $("bridge-context").value = selectedJob.context_seconds;
+    $("bridge-length").value = selectedJob.bridge_seconds;
+    $("bridge-direction").value = selectedJob.prompt;
+    updateBridgeTimeline();
+    $("bridge-form").scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (selectedJob) { applyForm(selectedJob); $("prompt").focus(); $("generation-form").scrollIntoView({ behavior: "smooth", block: "start" }); }
+});
+
+function bridgeValues() {
+  return { source_a: $("source-a").value, source_b: $("source-b").value,
+    context_seconds: Number($("bridge-context").value), bridge_seconds: Number($("bridge-length").value),
+    prompt: $("bridge-direction").value.trim() };
+}
+function updateBridgeTimeline() {
+  const value = bridgeValues();
+  const a = audioSources.find(source => source.id === value.source_a);
+  const b = audioSources.find(source => source.id === value.source_b);
+  const left = Math.min(a?.duration || value.context_seconds, value.context_seconds);
+  const right = Math.min(b?.duration || value.context_seconds, value.context_seconds);
+  $("bridge-timeline").textContent = `A 最后 ${left.toFixed(1)} 秒 → 新音乐 ${value.bridge_seconds} 秒 → B 最前 ${right.toFixed(1)} 秒 · 合计 ${(left + right + value.bridge_seconds).toFixed(1)} 秒`;
+  save("gallery-studio-bridge", value);
+}
+async function loadSources() {
+  try {
+    const previous = $("source-a").value ? bridgeValues() : stored("gallery-studio-bridge");
+    audioSources = await api("/api/sources");
+    for (const [id, preferred] of [["source-a", "audio:song_a.mp3"], ["source-b", "audio:song_b.mp3"]]) {
+      const select = $(id);
+      select.replaceChildren();
+      for (const source of audioSources) {
+        const option = document.createElement("option");
+        option.value = source.id;
+        option.textContent = `${source.title} · ${source.duration.toFixed(1)}s · ${source.group}`;
+        select.append(option);
+      }
+      const old = previous?.[id.replace("-", "_")];
+      if (audioSources.some(source => source.id === old)) select.value = old;
+      else if (audioSources.some(source => source.id === preferred)) select.value = preferred;
+      else select.selectedIndex = id === "source-a" ? 0 : Math.min(1, audioSources.length - 1);
+    }
+    if (previous) {
+      $("bridge-context").value = previous.context_seconds || 8;
+      $("bridge-length").value = previous.bridge_seconds || 12;
+      $("bridge-direction").value = previous.prompt || "";
+    }
+    $("bridge-note").textContent = audioSources.length >= 2 ? "默认取 A 的结尾和 B 的开头。原文件不会修改。" : "请将至少两段 WAV/MP3 放入项目 audio/ 或 assets/ 目录，或先生成音乐，然后刷新素材。";
+    updateBridgeTimeline();
+    updateButton();
+  } catch { $("bridge-note").textContent = "素材列表加载失败，请点击刷新素材重试。"; }
+}
+async function useAsSource(side, processed) {
+  const job = selectedJob;
+  if (!job || job.status !== "completed") return;
+  await loadSources();
+  const filename = processed
+    ? job.loop_version?.filename || `${job.id}-loop-${job.loop_version?.overlap_frames}.wav`
+    : job.filename || `${job.id}.${job.output_format}`;
+  const sourceId = processed && job.loop_version?.source_id || `generated:${filename}`;
+  if (!audioSources.some(source => source.id === sourceId)) {
+    $("bridge-note").textContent = "找不到这段素材，请刷新后重试。";
+    return;
+  }
+  $(`source-${side}`).value = sourceId;
+  updateBridgeTimeline();
+  $("bridge-note").textContent = `已将${processed ? "循环版本" : "原始文件"}设为 ${side.toUpperCase()}，选择另一端后即可生成过渡。`;
+  $("bridge-heading").scrollIntoView({behavior:"smooth", block:"start"});
+}
+for (const side of ["a", "b"]) {
+  $(`original-to-${side}`).addEventListener("click", () => useAsSource(side, false));
+  $(`loop-to-${side}`).addEventListener("click", () => useAsSource(side, true));
+}
+$("refresh-sources").addEventListener("click", loadSources);
+for (const id of ["source-a", "source-b", "bridge-context", "bridge-length", "bridge-direction"]) $(id).addEventListener("input", updateBridgeTimeline);
+$("bridge-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!keyConfigured || submitting || activeId) return;
+  const values = bridgeValues();
+  if (values.source_a === values.source_b) { $("bridge-note").textContent = "请选择不同的 A 和 B。"; return; }
+  submitting = true;
+  updateButton();
+  const pending = stored("gallery-studio-bridge-pending");
+  const requestId = pending && JSON.stringify(pending.values) === JSON.stringify(values) ? pending.id : crypto.randomUUID();
+  save("gallery-studio-bridge-pending", { id: requestId, values });
+  try {
+    const job = await api("/api/bridge", {method:"POST",
+      headers:{"Content-Type":"application/json", "X-Studio-Request":"1"},
+      body:JSON.stringify({...values, request_id:requestId})});
+    save("gallery-studio-bridge-pending", null);
+    upsert(job);
+    activeId = ["completed", "failed"].includes(job.status) ? null : job.id;
+    selectJob(job);
+    $("bridge-note").textContent = "自动流程已启动。可在上方试听区查看状态；请勿重复提交。";
+    $("job-progress").scrollIntoView({behavior:"smooth", block:"center"});
+    if (timer) clearTimeout(timer);
+    if (activeId) timer = setTimeout(poll, 1500);
+  } catch (error) {
+    $("bridge-note").textContent = `${error.message} 若提交后连接中断，请先刷新查看历史；相同输入重试会复用任务编号。`;
+    try {
+      allJobs = await api("/api/jobs");
+      const running = allJobs.find(job => !["completed", "failed"].includes(job.status));
+      if (running) {activeId = running.id; selectJob(running); timer = setTimeout(poll, 3000);}
+      renderHistory();
+    } catch { /* Retain the pending id rather than automatically repeating a paid request. */ }
+  } finally {submitting = false; updateButton();}
 });
 
 async function initialize() {
@@ -343,6 +463,7 @@ async function initialize() {
     renderHistory();
     refreshPrompt();
     updateButton();
+    await loadSources();
   } catch {
     $("key-status").textContent = "本地服务未连接";
     networkNote("无法连接本地服务，请重新打开「打开音乐工作室.command」后刷新页面。");

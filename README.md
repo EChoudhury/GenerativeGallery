@@ -1,102 +1,213 @@
-# Living Gallery — audio engine starter
+# Living Gallery — generative music and spatial transitions
 
-## Music generation UI / 音乐生成界面
+A local workbench for generating painting-inspired music with Stability AI, curating loops and connecting passages, and auditioning them in a five-column spatial grid.
 
-在 macOS 上双击 **`打开音乐工作室.command`**，浏览器会打开本地工作室。
-首次使用会安装所需的 Python 网页依赖；关闭运行服务的终端会停止服务。
+**The current workflow generates audio first, then plays saved files.** Visitor movement controls playback; it does not make a live API request. The studio and grid are separate local services.
 
-在项目根目录创建 `.env`（不要提交到 GitHub）：
+| Service | Address | Purpose |
+| --- | --- | --- |
+| Sound Studio | <http://127.0.0.1:7860/> | Generate, audition, loop, and connect two recordings |
+| Spatial Grid | <http://127.0.0.1:8000/> | Move between five saved music cells with playback crossfades |
+
+## Set up
+
+Run commands from the repository root. Use Python 3.10 or later.
+
+On macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+On Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+If activation is blocked, use `.\.venv\Scripts\python.exe` in place of `python`.
+
+Create `.env` in the repository root:
 
 ```dotenv
 STABILITY_API_KEY=your_stability_api_key
 ```
 
-输入英文音乐提示词、选择时长（1–380 秒）和 WAV/MP3，点击 **Generate music**。
-每次生成会使用 Stability API credits。生成完成后可试听、循环播放、下载或复用提示词。
-“Loop-oriented” 会追加循环结构提示，不保证生成文件首尾无缝；循环试听仅重复原始文件。
-试听区的 **循环接缝处理** 可设置首尾重叠时长（0.05–10 秒，且小于原音频一半），
-在本地交叉淡化后导出 24-bit WAV。可对比原始与处理版本，并从接缝前开始重复试听。
-该操作不调用 Stability API、不消耗 credits、不覆盖原文件。处理结果和参数随历史保存。
-输出时长会缩短一个重叠长度，不自动匹配节拍或和声；有节奏的素材需额外试听和对齐。
-音频及其提示词历史保存在 `assets/generated/`，该目录已忽略，不会进入 Git 提交。
-历史与输入草稿可在刷新后恢复。只允许一个生成任务同时运行；不会自动重试付费请求。
-若生成超时或服务在生成时重启，请先检查 Stability 账户记录，避免重复生成产生费用。
+Never commit the key. It is read by the local backend, not exposed to the browser. Generation uses your Stability account credits; local loop processing and playback do not.
 
-手动启动：
+Start the studio:
 
 ```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
 python studio.py
 ```
 
-默认地址是 `http://127.0.0.1:7860`。API key 只由本地后端读取，不发送给浏览器。
-该界面独立于 `server.py` 的位置混音服务，也不修改现有音频素材。
+On macOS, you can instead double-click `打开音乐工作室.command`, which prepares dependencies and opens the studio. Keep the service terminal running.
 
----
+## Transition workflow: from two paintings to five cells
 
-A small first milestone for the ADE hackathon prototype:
-- continuously plays looping WAV layers
-- smoothly crossfades between `storm`, `machine`, and `dream`
-- lets you switch artworks from the terminal
-- includes generated placeholder audio so you can test before using Stable Audio
-
-## 1. Requirements
-
-Use Python 3.10+ if possible. On Windows, run these commands in PowerShell from this folder.
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+```text
+Generate A and B → curate their loops
+                         ↓
+A ending + masked interval + B beginning
+                         ↓
+             Stability inpainting
+                         ↓
+       Listen and select a good middle excerpt
+                         ↓
+    Two audio-to-audio variations of that excerpt
+                         ↓
+ A | A-leaning | curated middle | B-leaning | B
+                         ↓
+          Spatial playback crossfades
 ```
 
-If PowerShell blocks activation, you can use the venv Python directly:
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+There are three different operations here:
+
+| Operation | What it does | When it runs |
+| --- | --- | --- |
+| **Inpainting** | Generates a bridge with actual A and B audio on either side as context | Preparation; one paid request per candidate |
+| **Audio-to-audio**, called `transition()` in the code | Reinterprets one input excerpt according to a prompt | Preparation; two paid requests to build the interior variations |
+| **Playback crossfade** | Fades the outgoing cell down and incoming cell up | Locally while the visitor moves; no generation |
+
+### 1. Generate and prepare the two endpoint loops
+
+In the studio, enter the artwork name, prompt, duration and output format. Prefer WAV for editing. Generate candidates and choose one for each painting.
+
+New recordings use names such as `Mondrian-001.wav`, with numbers allocated per artwork. The **Loop-oriented** option adds structural guidance to the prompt; it does not guarantee a seamless file.
+
+In **Your listening room → 循环接缝处理**:
+
+1. Choose the head/tail overlap, for example 1 second.
+2. Process the loop and audition its wrap several times.
+3. Use **用此 Loop 作为 A** for the starting painting, and **用此 Loop 作为 B** for the destination. Original recordings also have A/B buttons.
+
+Loop processing is local and leaves the original unchanged. A 30-second recording with a 1-second overlap becomes 29 seconds. This removes a waveform discontinuity but does not automatically align beats or harmonies. All overlap settings must be shorter than half the source duration.
+
+Completed recordings and processed loops appear in the transition source list automatically. **Between two paintings** is the last section of the studio, after generation, listening and loop preparation.
+
+### 2. Generate a connecting passage with inpainting
+
+In **Between two paintings**, choose the prepared A/B loops. The starting settings are:
+
+- A context: its last **8 seconds**.
+- New bridge: **12 seconds**.
+- B context: its first **8 seconds**.
+
+The 28-second reference consists of `A[8s] + silence[12s] + B[8s]`. The silent middle is the generation mask. The optional musical-direction field supplements a default connecting-passage prompt.
+
+The automated pipeline in `transition_builder.py`:
+
+1. Converts the selected context to 44.1 kHz stereo.
+2. Submits the reference and middle mask to Stability inpainting.
+3. Waits for the complete generated result.
+4. Restores the original A/B context outside the middle, blending over 50 ms at each join.
+5. Exports the full transition and a separate bridge with 50 ms of join allowance on each side. If necessary, the assembled output receives a common gain reduction to prevent clipping.
+
+For the default settings, listen especially to **8–20 seconds** in the full transition. The separate bridge export is **12.1 seconds**, including its join allowances.
+
+You can also run the same workflow from the terminal:
+
+```bash
+python transition_builder.py --a "audio/painting-a-loop.wav" --b "audio/painting-b-loop.wav" --context 8 --bridge 12 --output-dir assets/generated/bridge-candidate-01
 ```
 
-On macOS/Linux, activate with `source .venv/bin/activate`.
+Replace the two input paths with real recordings. Add `--prompt "Your musical direction"` to steer the bridge. Add `--prepare-only` to create the reference and plan without a paid request. Use a new output directory for each candidate to preserve previous takes.
 
-## 2. Create placeholder sounds
+### 3. Curate the middle state
 
-```powershell
+A directional bridge is not automatically a good place to stay and listen. Audition candidates and select a passage that feels convincing as a mixture of the two paintings. It can be shorter than the generated bridge.
+
+Record its **start and end times relative to the full transition file**. The grid builder below extracts that interval and keeps an exact original excerpt as well as a processed loop version.
+
+This is the curator's role: choose the musical result, not just a numerical “50/50” point. Check the selected passage's loop as well as its connections to neighboring cells.
+
+### 4. Build and install the five-cell grid
+
+Use `curated_grid.py` with the approved endpoint loops, the full transition recording, and the selected interval:
+
+```bash
+python curated_grid.py --source "assets/generated/bridge-candidate-01/transition.wav" --start 8 --end 20 --a "audio/painting-a-loop.wav" --b "audio/painting-b-loop.wav" --output-dir assets/generated/grid-candidate-01
+```
+
+**Before using this for another pair of paintings, edit `PROMPTS` in `curated_grid.py`.** They currently describe Mondrian and Morandi. The source filenames alone do not adapt these prompts.
+
+| Grid column | Content | Preparation |
+| --- | --- | --- |
+| 0 | Approved A loop | Copied unchanged |
+| 1 | A-leaning version of the curated middle | Audio-to-audio, using the middle as reference and an A-leaning prompt |
+| 2 | Curated middle excerpt | Extracted from the selected recording |
+| 3 | B-leaning version of the curated middle | Audio-to-audio, using the middle as reference and a B-leaning prompt |
+| 4 | Approved B loop | Copied unchanged |
+
+Columns 1 and 3 use **the middle excerpt as their audio input**, not both endpoint recordings. They are prompted variations, not mathematically interpolated mixtures. Their transformation strength is currently `0.4`.
+
+The builder applies a 0.25-second circular crossfade to all three interior cells. A 12-second excerpt therefore produces an **11.75-second** loop; a 9-second excerpt produces an **8.75-second** loop. Endpoints retain their existing loop processing.
+
+After generation and validation, the builder installs `audio/cell_0.wav` through `audio/cell_4.wav` and writes `audio/grid_manifest.json`. The output directory retains the raw generations, original middle excerpt, plan, manifest, and a `previous-grid/` backup of the replaced files.
+
+**Use a fresh output directory whenever inputs, prompts or timing change.** Existing `cell_1-raw.wav` and `cell_3-raw.wav` in that directory are reused rather than submitted again. A normal new run uses two paid generations in addition to the earlier inpainting request. Installation replaces the active grid, so run one grid build at a time.
+
+### 5. Audition the grid
+
+Start the grid in a second terminal with the same Python environment:
+
+```bash
+python -m uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000/>, start playback, and move the X control through the five columns. After replacing audio, reload the page so it loads the new files.
+
+The grid prefers WAV cells and falls back to the original MP3 cells. X chooses a column; **Y currently does not change the audio**. Crossing a column boundary starts its track and crossfades between the outgoing and incoming players. The default fade is 3 seconds and is adjustable. It does not continuously interpolate a generated musical representation or synchronize the cells' beats/playheads.
+
+Listen while moving both ways, stopping in each cell and crossing boundaries slowly and quickly. A smooth volume envelope can still conceal an awkward musical change; judge both the loop and the transition by ear.
+
+## Current Mondrian → Morandi example
+
+The latest installed grid uses:
+
+| Role | Local source |
+| --- | --- |
+| A | `assets/generated/Mondrian-Boogie-Revival-loop-44100.wav` — 29 seconds, 1-second loop overlap |
+| B | `assets/generated/754b73fa-411e-46c2-806d-26a3dcbd94ad-loop-220500.wav` — 27 seconds, 5-second loop overlap |
+| Inpainted transition | `assets/generated/fef122da-674a-486f-840d-4781a408cc33.wav` — 28 seconds |
+| Selected middle | Seconds **8–20** of that transition |
+| Grid generation records and previous-grid backup | `assets/generated/curated-grid-boogie-revival-20261021/` |
+
+The five active durations are **29 / 11.75 / 11.75 / 11.75 / 27 seconds**. Check `audio/grid_manifest.json` for the active source paths, prompts, excerpt interval and file hashes; subsequent builds change these values.
+
+## What can improve the musical transition?
+
+Current technical checks cover file validity, duration and export levels. They do not assess musical compatibility. Neither BPM in a prompt nor the word “loop” guarantees beat alignment.
+
+A next experiment is to reduce rhythmic density before changing speed: keep the opening pulse, thin the attacks into a half-time feel, then let sparse notes and sustained tones approach the destination. Manually select musically useful reference boundaries and durations. **Automatic tempo detection, beat/phrase alignment and this rhythmic-transition strategy are not implemented in the current grid.**
+
+We have also generated separate Mondrian piano, rhythmic-accent and sustained-harmony candidates. These are independently generated parts, not synchronized stems extracted from one performance. They still require compatibility checks and alignment. The combined previews are experiments; **they are not used by the current five-cell grid**. A future layered player could fade rhythmic and melodic parts independently while keeping a compatible background active.
+
+## Sharing the work with collaborators
+
+- Commit source code and documentation; keep `.env` private.
+- `assets/generated/` is Git-ignored. A fresh clone does **not** contain the studio history, example sources, or generation backups listed above. Share the approved audio and its plan/manifest separately, then have collaborators use their local paths.
+- Grid manifests contain machine-specific absolute source paths. They document provenance; collaborators need the actual recordings to rebuild.
+- The studio allows one generation job at a time and does not automatically retry paid requests. If a connection times out or the service restarts during generation, check the Stability account before submitting again.
+- Changing the studio source code requires a service restart; wait until any generation finishes first.
+
+## Earlier terminal mixer demo
+
+The separate `gallery_engine.py` demo uses the `storm`, `machine` and `dream` layers in `gallery.json`:
+
+```bash
 python make_demo_assets.py
-```
-
-This creates loopable test WAV files in `assets/`. They are synthesized placeholders, not the final generative audio.
-
-## 3. Run the mixer
-
-```powershell
 python gallery_engine.py
 ```
 
-Type `storm`, `machine`, or `dream` and press Enter to switch. Type `q` to quit.
-Use headphones or start with low volume.
+Type an artwork name to switch, or `q` to quit. These synthesized placeholder layers and this terminal mixer are separate from the Mondrian/Morandi browser grid. The terminal mixer loads WAVs at startup; restart it after replacing its assets.
 
-If you get an audio-device error, run:
-```powershell
+If needed, inspect audio devices with:
+
+```bash
 python -c "import sounddevice as sd; print(sd.query_devices())"
 ```
-Then share the error and device list. On Windows, make sure the intended output device is enabled in Sound settings.
-
-## 4. Replace placeholders with Stable Audio
-
-Keep the filenames the same, or update `gallery.json` to match your generated WAV filenames. The mixer loads WAV files at startup, so stop and restart it after replacing assets.
-
-Stable Audio 3's official repo and CLI instructions:
-https://github.com/Stability-AI/stable-audio-3
-
-Once Stable Audio is installed, generate clips offline rather than inside the real-time audio callback. Example CLI command from the official repo:
-```bash
-stable-audio --model small-music -p "Atmospheric dark ambient soundscape, slow evolving low drone, no vocals, no percussion" --duration 30 -o assets/storm_drone.wav
-```
-
-Generate distinct layers for each artwork, for example:
-- storm: low drone + sparse granular/rain texture
-- machine: pulsing mechanical ambience + metallic texture
-- dream: warm sustained pad + airy shimmer
-
-The mixer currently loops each file. If a generated clip has a noticeable seam, try a different generation or we can add loop-point/crossfade processing next.

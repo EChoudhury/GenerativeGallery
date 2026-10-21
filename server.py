@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------
 
 GRID_SIZE = 5
-AUDIO_DIR = Path("audio")
+AUDIO_DIR = Path(__file__).resolve().parent / "audio"
 
 app = FastAPI(title="Gallery Grid Audio Server")
 
@@ -71,7 +71,10 @@ current_position = {"x": 2.5, "y": 2.5}
 # ---------------------------------------------------------------------
 
 def get_audio_path(col: int) -> Path:
-    """Return the MP3 file for a column."""
+    """Prefer lossless curated cells, falling back to the original MP3 grid."""
+    wav = AUDIO_DIR / f"cell_{col}.wav"
+    if wav.is_file():
+        return wav
     return AUDIO_DIR / f"cell_{col}.mp3"
 
 
@@ -139,7 +142,7 @@ def update_position(position: Position) -> dict:
     }
 
 
-@app.get("/audio/{col}")
+@app.get("/audio/{col:int}")
 def stream_audio(col: int) -> FileResponse:
     """Stream the MP3 associated with a column."""
     if col < 0 or col >= GRID_SIZE:
@@ -158,7 +161,7 @@ def stream_audio(col: int) -> FileResponse:
 
     return FileResponse(
         path,
-        media_type="audio/mpeg",
+        media_type="audio/wav" if path.suffix == ".wav" else "audio/mpeg",
         headers={
             "Cache-Control": "no-cache",
         },

@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
+import numpy as np
+import soundfile as sf
 
 import uvicorn
 import studio
@@ -177,7 +179,7 @@ class StudioHTTPTests(unittest.TestCase):
         with patch.object(studio.executor, "submit"):
             self.assertEqual(self.call("/api/generate", body)[0], 202)
         job_id = body["request_id"]
-        source = studio.OUTPUT_DIR / f"{job_id}.wav"
+        source = studio.recording_path(studio.jobs[job_id])
         original = wav_bytes()
         source.write_bytes(original)
         studio.update_job(job_id, status="completed", audio_url=f"/api/audio/{job_id}")
@@ -189,6 +191,17 @@ class StudioHTTPTests(unittest.TestCase):
         self.assertAlmostEqual(result["duration"], 0.08)
         self.assertEqual(result["overlap_frames"], 160)
         self.assertEqual(source.read_bytes(), original)
+        self.assertNotIn(job_id, result["filename"])
+        library = json.loads(self.call("/api/sources")[2])
+        chosen = next(item for item in library if item["id"] == result["source_id"])
+        self.assertIn("Loop", chosen["title"])
+        self.assertEqual(chosen["variant"], "loop")
+        # A processed loop can be submitted directly as one inpainting anchor.
+        with patch.object(studio.executor, "submit"):
+            request = {"request_id": str(uuid.uuid4()), "source_a": result["source_id"],
+                       "source_b": f"generated:{source.name}", "context_seconds": 1, "bridge_seconds": 4}
+            self.assertEqual(self.call("/api/bridge", request)[0], 202)
+            studio.update_job(request["request_id"], status="failed")
         status, headers, content = self.call(result["audio_url"] + "?download=true")
         self.assertEqual(status, 200)
         self.assertIn("audio/wav", headers["Content-Type"])
@@ -204,6 +217,60 @@ class StudioHTTPTests(unittest.TestCase):
         studio.restore_history()
         self.assertEqual(studio.jobs[job_id]["loop_version"]["duration"], result["duration"])
         self.assertEqual(self.call(f"/api/jobs/{uuid.uuid4()}/loop", {"crossfade_seconds": 1})[0], 404)
+
+    def test_artwork_numbering_safe_names_and_workflow_order(self):
+        with patch.object(studio.executor, "submit"):
+            first = json.loads(self.call("/api/generate", self.body(title="Test artwork / 花"))[2])
+            self.assertEqual(first["filename"], "Test artwork - 花-001.wav")
+            studio.update_job(first["id"], status="failed")
+            second = json.loads(self.call("/api/generate", self.body(title="Test artwork / 花"))[2])
+            self.assertEqual(second["filename"], "Test artwork - 花-002.wav")
+        page = self.call("/")[2].decode()
+        self.assertLess(page.index('id="loop-heading"'), page.index('id="bridge-heading"'))
+        self.assertIn('id="loop-to-a"', page)
+        self.assertIn('id="loop-to-b"', page)
+
+    def test_bridge_sources_validation_idempotency_and_async_export(self):
+        a = studio.OUTPUT_DIR / "test-anchor-a.wav"
+        b = studio.OUTPUT_DIR / "test-anchor-b.wav"
+        sf.write(a, np.full(16000, 0.1), 8000)
+        sf.write(b, np.full(16000, 0.2), 8000)
+        sources = json.loads(self.call("/api/sources")[2])
+        self.assertIn("generated:test-anchor-a.wav", {source["id"] for source in sources})
+        body = {"request_id": str(uuid.uuid4()), "source_a": "generated:test-anchor-a.wav",
+                "source_b": "generated:test-anchor-b.wav", "context_seconds": 1, "bridge_seconds": 4}
+        # Fill the HTTP result from the posted reference without making any remote request.
+        def post_response(*args, **kwargs):
+            data = kwargs["data"]
+            reference, rate = sf.read(kwargs["files"]["audio"], dtype="float32", always_2d=True)
+            reference[round(data["mask_start"]*rate):round(data["mask_end"]*rate)] = 0.15
+            output = io.BytesIO()
+            sf.write(output, reference, rate, format="WAV", subtype="FLOAT")
+            finished.content = output.getvalue()
+            return response
+        response = Mock(status_code=202)
+        response.json.return_value = {"id": "fake-inpaint"}
+        finished = Mock(status_code=200)
+        with patch("generate_assets.requests.post", side_effect=post_response) as provider, \
+             patch("generate_assets.requests.get", return_value=finished), \
+             patch("generate_assets.time.sleep"):
+            self.assertEqual(self.call("/api/bridge", body)[0], 202)
+            for _ in range(200):
+                job = json.loads(self.call(f"/api/jobs/{body['request_id']}")[2])
+                if job["status"] in studio.TERMINAL:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(job["status"], "completed", job.get("error"))
+            self.assertEqual(job["duration"], 6)
+            self.assertEqual(self.call("/api/bridge", body)[0], 202)
+            self.assertEqual(provider.call_count, 1)
+        self.assertEqual(self.call(job["audio_url"])[0], 200)
+        status, headers, data = self.call(job["bridge_url"] + "?download=true")
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertAlmostEqual(sf.info(io.BytesIO(data)).duration, 4.1)
+        self.assertEqual(self.call("/api/bridge", {**body, "request_id": str(uuid.uuid4()), "source_a": "../.env"})[0], 422)
+        self.assertEqual(self.call("/api/bridge", {**body, "request_id": str(uuid.uuid4()), "source_a": body["source_b"]})[0], 422)
 
 
 if __name__ == "__main__":

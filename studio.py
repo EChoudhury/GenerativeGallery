@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import threading
 import uuid
@@ -20,6 +22,8 @@ import requests
 
 from generate_assets import StabilityAudioClient
 from loop_processing import export_loop
+from transition_builder import build_transition, DEFAULT_PROMPT, BridgeError
+import soundfile as sf
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "assets" / "generated"
@@ -74,6 +78,85 @@ class Generation(BaseModel):
 
 class LoopProcessing(BaseModel):
     crossfade_seconds: float = Field(default=1.0, gt=0, le=10, allow_inf_nan=False)
+
+
+class BridgeGeneration(BaseModel):
+    request_id: uuid.UUID
+    source_a: str = Field(min_length=1, max_length=300)
+    source_b: str = Field(min_length=1, max_length=300)
+    context_seconds: float = Field(default=8, ge=1, le=20, allow_inf_nan=False)
+    bridge_seconds: float = Field(default=12, ge=1, le=120, allow_inf_nan=False)
+    prompt: str = Field(default="", max_length=8000)
+
+
+def safe_title(title):
+    """Keep artwork names readable while excluding filesystem separators."""
+    return re.sub(r'[^\w .-]+', '-', title, flags=re.UNICODE).strip(' .-')[:80] or "Untitled study"
+
+
+def recording_filename(title, extension):
+    """Reserve an artwork-scoped number; call while holding job_lock."""
+    stem = safe_title(title)
+    number = 1
+    reserved = {f"{recording_label(job)}.{extension}" for job in jobs.values()}
+    while True:
+        name = f"{stem}-{number:03d}.{extension}"
+        if name not in reserved and not (OUTPUT_DIR / name).exists():
+            return name
+        number += 1
+
+
+def recording_path(job):
+    return OUTPUT_DIR / job.get("filename", f"{job['id']}.{job['output_format']}")
+
+
+def recording_label(job):
+    if job.get("filename"):
+        return Path(job["filename"]).stem
+    # Give historical downloads readable, stable names without moving old files.
+    siblings = sorted((j for j in jobs.values() if safe_title(j["title"]) == safe_title(job["title"])),
+                      key=lambda j: (j["created_at"], j["id"]))
+    number = next((i + 1 for i, j in enumerate(siblings) if j["id"] == job["id"]), 1)
+    return f"{safe_title(job['title'])}-{number:03d}"
+
+
+def loop_path(job, frames):
+    named = OUTPUT_DIR / f"{recording_label(job)}-loop-{frames}.wav"
+    return named if named.is_file() else OUTPUT_DIR / f"{job['id']}-loop-{frames}.wav"
+
+
+def source_files():
+    """Allow only audio files in the three known library directories."""
+    roots = {"audio": ROOT / "audio", "assets": ROOT / "assets", "generated": OUTPUT_DIR}
+    return {f"{group}:{path.name}": path for group, directory in roots.items()
+            if directory.is_dir() for path in sorted(directory.iterdir())
+            if path.is_file() and not path.is_symlink() and path.suffix.lower() in {".wav", ".mp3"}}
+
+
+def generate_bridge(job_id, key, source_a, source_b):
+    with job_lock:
+        job = dict(jobs[job_id])
+    client = None
+    try:
+        client = StabilityAudioClient(api_key=key, poll_interval=3)
+        directory = OUTPUT_DIR / f"{job_id}-transition"
+        result = build_transition(
+            source_a, source_b, directory, job["context_seconds"], job["bridge_seconds"],
+            prompt=job["prompt"], client=client,
+            on_status=lambda state: update_job(job_id, status=state),
+        )
+        shutil.copyfile(directory / "transition.wav", recording_path(job))
+        update_job(job_id, status="completed", audio_url=f"/api/audio/{job_id}",
+                   duration=result["report"]["duration"], transition_report=result["report"],
+                   bridge_url=f"/api/audio/{job_id}/bridge",
+                   completed_at=datetime.now(timezone.utc).isoformat())
+    except BridgeError as exc:
+        update_job(job_id, status="failed", error=str(exc))
+    except Exception as exc:
+        update_job(job_id, status="failed", error=friendly_error(exc))
+    finally:
+        if client is not None:
+            client.session.close()
 
 
 def persist(job):
@@ -133,7 +216,7 @@ def generate(job_id, key):
     try:
         update_job(job_id, status="submitting")
         client = StabilityAudioClient(api_key=key, poll_interval=3)
-        destination = OUTPUT_DIR / f"{job_id}.{job['output_format']}"
+        destination = recording_path(job)
         client.generate(
             job["effective_prompt"], output=destination, duration=job["duration"],
             on_status=lambda state: update_job(job_id, status=state),
@@ -177,6 +260,81 @@ def history():
                       key=lambda job: job["created_at"], reverse=True)
 
 
+@app.get("/api/sources")
+def sources():
+    with job_lock:
+        completed = [dict(job) for job in jobs.values() if job["status"] == "completed"]
+        labels = {}
+        for job in completed:
+            label = recording_label(job)
+            labels[recording_path(job).name] = (label + " · Original", "original")
+            for path in OUTPUT_DIR.glob(f"{job['id']}-loop-*.wav"):
+                frames = path.stem.rsplit("-", 1)[-1]
+                if frames.isdigit():
+                    try:
+                        rate = sf.info(path).samplerate
+                    except (OSError, RuntimeError):
+                        continue
+                    labels[path.name] = (f"{label} · Loop · {int(frames)/rate:g}s crossfade", "loop")
+            for path in OUTPUT_DIR.glob(f"{label}-loop-*.wav"):
+                frames = path.stem.rsplit("-", 1)[-1]
+                if frames.isdigit():
+                    try:
+                        rate = sf.info(path).samplerate
+                    except (OSError, RuntimeError):
+                        continue
+                    labels[path.name] = (f"{label} · Loop · {int(frames)/rate:g}s crossfade", "loop")
+    result = []
+    for source_id, path in source_files().items():
+        try:
+            info = sf.info(path)
+        except (OSError, RuntimeError):
+            continue
+        label, variant = labels.get(path.name, (path.stem, "file"))
+        result.append({"id": source_id, "title": label, "variant": variant,
+                       "group": source_id.split(":", 1)[0], "duration": info.duration})
+    return result
+
+
+@app.post("/api/bridge", status_code=202)
+def create_bridge(body: BridgeGeneration):
+    key = api_key()
+    if not key:
+        raise HTTPException(503, "请先配置 STABILITY_API_KEY。")
+    job_id = str(body.request_id)
+    with job_lock:
+        if job_id in jobs:
+            return dict(jobs[job_id])
+    available = source_files()
+    if body.source_a not in available or body.source_b not in available:
+        raise HTTPException(422, "找不到选取的音频，请刷新素材列表后重选。")
+    if body.source_a == body.source_b:
+        raise HTTPException(422, "请选择不同的 A、B 音频。")
+    a, b = available[body.source_a], available[body.source_b]
+    source_labels = {item["id"]: item["title"] for item in sources()}
+    title = f"{source_labels.get(body.source_a, a.stem).split(' · ')[0]} to {source_labels.get(body.source_b, b.stem).split(' · ')[0]}"
+    job = {
+        "id": job_id, "kind": "bridge", "title": title,
+        "source_a": body.source_a, "source_b": body.source_b,
+        "context_seconds": body.context_seconds, "bridge_seconds": body.bridge_seconds,
+        "prompt": body.prompt.strip(), "effective_prompt": DEFAULT_PROMPT + (
+            "\n\nAdditional musical direction: " + body.prompt.strip() if body.prompt.strip() else ""),
+        "duration": 2 * body.context_seconds + body.bridge_seconds, "output_format": "wav",
+        "loop": False, "status": "queued", "created_at": datetime.now(timezone.utc).isoformat(),
+        "audio_url": None, "error": None,
+    }
+    with job_lock:
+        if job_id in jobs:
+            return dict(jobs[job_id])
+        if any(item["status"] not in TERMINAL for item in jobs.values()):
+            raise HTTPException(409, "已有生成任务在运行，请等待完成后再提交。")
+        job["filename"] = recording_filename(job["title"], job["output_format"])
+        persist(job)
+        jobs[job_id] = job
+        executor.submit(generate_bridge, job_id, key, a, b)
+        return dict(job)
+
+
 @app.post("/api/generate", status_code=202)
 def create_generation(body: Generation):
     key = api_key()
@@ -198,6 +356,7 @@ def create_generation(body: Generation):
             "status": "queued", "created_at": datetime.now(timezone.utc).isoformat(),
             "audio_url": None, "error": None,
         }
+        job["filename"] = recording_filename(job["title"], job["output_format"])
         persist(job)
         jobs[job_id] = job
         executor.submit(generate, job_id, key)
@@ -220,11 +379,11 @@ def audio(job_id: uuid.UUID, download: bool = False):
     if job.get("status") != "completed":
         raise HTTPException(404, "音频尚未生成。")
     extension = job["output_format"]
-    path = OUTPUT_DIR / f"{job_id}.{extension}"
+    path = recording_path(job)
     if not path.is_file():
         raise HTTPException(404, "音频文件不存在。")
     return FileResponse(path, media_type="audio/wav" if extension == "wav" else "audio/mpeg",
-                        filename=f"gallery-{job_id}.{extension}" if download else None)
+                        filename=f"{recording_label(job)}.{extension}" if download else None)
 
 
 @app.post("/api/jobs/{job_id}/loop")
@@ -233,13 +392,18 @@ def process_loop(job_id: uuid.UUID, body: LoopProcessing):
         job = dict(jobs.get(str(job_id), {}))
     if job.get("status") != "completed":
         raise HTTPException(404, "请先选择一段已生成的音频。")
-    source = OUTPUT_DIR / f"{job_id}.{job['output_format']}"
+    source = recording_path(job)
     if not source.is_file():
         raise HTTPException(404, "原始音频文件不存在。")
     # This is local audio processing only: no API call, no additional credits.
     with loop_lock:
         try:
             loop = export_loop(source, OUTPUT_DIR, str(job_id), body.crossfade_seconds)
+            raw = OUTPUT_DIR / f"{job_id}-loop-{loop['overlap_frames']}.wav"
+            named = OUTPUT_DIR / f"{recording_label(job)}-loop-{loop['overlap_frames']}.wav"
+            raw.replace(named)
+            loop["filename"] = named.name
+            loop["source_id"] = f"generated:{named.name}"
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         except Exception as exc:
@@ -253,12 +417,24 @@ def loop_audio(job_id: uuid.UUID, frames: int, download: bool = False):
     if frames <= 0:
         raise HTTPException(404, "循环文件不存在。")
     with job_lock:
-        ready = jobs.get(str(job_id), {}).get("status") == "completed"
-    path = OUTPUT_DIR / f"{job_id}-loop-{frames}.wav"
+        job = dict(jobs.get(str(job_id), {}))
+        ready = job.get("status") == "completed"
+    path = loop_path(job, frames) if ready else OUTPUT_DIR / "missing"
     if not ready or not path.is_file():
         raise HTTPException(404, "循环文件不存在，请先处理接缝。")
     return FileResponse(path, media_type="audio/wav",
-                        filename=f"gallery-{job_id}-loop.wav" if download else None)
+                        filename=f"{recording_label(job)}-loop-{frames}.wav" if download else None)
+
+
+@app.get("/api/audio/{job_id}/bridge")
+def bridge_audio(job_id: uuid.UUID, download: bool = False):
+    with job_lock:
+        job = dict(jobs.get(str(job_id), {}))
+    path = OUTPUT_DIR / f"{job_id}-transition" / "bridge.wav"
+    if job.get("status") != "completed" or job.get("kind") != "bridge" or not path.is_file():
+        raise HTTPException(404, "中间段尚未准备好。")
+    return FileResponse(path, media_type="audio/wav",
+                        filename=f"{recording_label(job)}-bridge.wav" if download else None)
 
 
 if __name__ == "__main__":

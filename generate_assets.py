@@ -65,9 +65,13 @@ class StabilityAudioClient:
         output="transition.mp3",
         duration=30,
         strength=0.4,
+        on_status=None,
     ):
         """Transform an input audio file according to a text prompt."""
         input_path = Path(input_audio)
+        output_format = Path(output).suffix.lower().lstrip(".")
+        if output_format not in {"mp3", "wav"}:
+            raise ValueError("Output filename must end in .mp3 or .wav.")
 
         if not input_path.is_file():
             raise FileNotFoundError(f"Input audio not found: {input_path}")
@@ -79,14 +83,28 @@ class StabilityAudioClient:
                 files={"audio": audio_file},
                 data={
                     "prompt": prompt,
-                    "output_format": "mp3",
+                    "output_format": output_format,
                     "duration": duration,
                     "strength": strength,
                 },
                 timeout=180,
             )
 
-        return self._wait_for_result(response, output)
+        return self._wait_for_result(response, output, on_status=on_status)
+
+    def inpaint(self, input_audio, prompt, output, duration, mask_start, mask_end,
+                on_status=None):
+        """Generate only a masked interval, using audio on both sides as context."""
+        with Path(input_audio).open("rb") as audio_file:
+            response = requests.post(
+                f"{self.BASE_URL}/stable-audio/inpaint",
+                headers=self.headers,
+                files={"audio": audio_file},
+                data={"prompt": prompt, "output_format": "wav", "duration": duration,
+                      "mask_start": mask_start, "mask_end": mask_end},
+                timeout=180,
+            )
+        return self._wait_for_result(response, output, on_status=on_status)
 
     def _wait_for_result(self, response, output, on_status=None):
         """Poll the asynchronous generation job and save its audio."""

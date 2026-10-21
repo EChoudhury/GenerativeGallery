@@ -33,7 +33,7 @@
       <section class="composer panel">
         <div class="panel-heading"><div><span class="section-index">01 / COMPOSE</span><h2>What does it sound like?</h2></div><span class="small-tag">TEXT → AUDIO</span></div>
         <form id="generation-form">
-          <label for="title">Study name <span>给这次实验起个名字</span></label>
+          <label for="title">Artwork name <span>作品名 · 文件自动按编号保存</span></label>
           <input id="title" name="title" maxlength="100" placeholder="Untitled study" value="Victory Boogie Woogie">
           <div class="label-row"><label for="prompt">Music prompt <span>描述你想听到的音乐</span></label><span id="char-count">0 / 9000</span></div>
           <textarea id="prompt" name="prompt" maxlength="9000" required spellcheck="false" placeholder="Describe the mood, instruments, rhythm, texture and space…"></textarea>
@@ -63,16 +63,31 @@
       <div id="output-empty" class="output-empty"><span class="empty-disc" aria-hidden="true">◉</span><div><h3>A new sound starts here.</h3><p>生成完成后，在这里试听、重复播放和下载。</p></div></div>
       <div id="job-progress" class="job-progress" hidden role="status" aria-live="polite"><div class="progress-top"><span class="spinner"></span><div><h3 id="progress-title">正在提交…</h3><p id="progress-detail">可以保留页面等待；刷新页面也能恢复任务状态。</p></div><span id="elapsed"></span></div><div class="indeterminate"><span></span></div><p class="progress-footnote">生成时间取决于服务负载与时长。这里显示任务状态，不预估完成百分比。</p></div>
       <div id="job-error" class="error-panel" hidden role="alert"></div>
-      <div id="result" hidden><div class="result-top"><div class="record-art" aria-hidden="true"><span>◉</span></div><div class="result-info"><span id="result-meta" class="section-index"></span><h3 id="result-title"></h3><p id="result-date"></p></div><a id="download" class="download-button" href="#" download>原始文件 <span>↓</span></a></div><audio id="audio" controls preload="metadata"></audio><div class="result-controls"><label for="preview-loop"><input id="preview-loop" type="checkbox" checked> 循环试听原始文件</label><button id="reuse" class="text-button" type="button">复用这次提示词 ↗</button></div></div>
+      <div id="result" hidden><div class="result-top"><div class="record-art" aria-hidden="true"><span>◉</span></div><div class="result-info"><span id="result-meta" class="section-index"></span><h3 id="result-title"></h3><p id="result-date"></p></div><a id="download" class="download-button" href="#" download>原始文件 <span>↓</span></a></div><audio id="audio" controls preload="metadata"></audio><div class="result-controls"><button type="button" class="text-button" id="original-to-a">用原始文件作为 A ↓</button><button type="button" class="text-button" id="original-to-b">用原始文件作为 B ↓</button><label for="preview-loop"><input id="preview-loop" type="checkbox" checked> 循环试听原始文件</label><button id="reuse" class="text-button" type="button">复用这次提示词 ↗</button></div></div>
+      <div id="bridge-result" class="bridge-result" hidden><p id="bridge-report"></p><a id="download-bridge" class="download-button" download>下载中间段 WAV（含接缝余量） ↓</a></div>
       <section class="loop-editor" aria-labelledby="loop-heading">
         <div class="loop-heading"><div><span class="section-index">REFINE / LOOP CROSSFADE</span><h3 id="loop-heading">循环接缝处理</h3></div><span class="local-processing">本地处理 · 不消耗 credits</span></div>
         <p class="loop-description">把原音频的结尾与开头重叠混合，生成适合重复试听的 WAV。原始文件保持不变。</p>
         <fieldset id="loop-controls" disabled><legend class="visually-hidden">交叉淡化设置</legend><label for="crossfade">首尾重叠时长</label><div class="crossfade-controls"><input id="crossfade" type="range" min="0.05" max="10" step="0.05" value="1"><div class="seconds-field"><input id="crossfade-seconds" type="number" aria-label="交叉淡化秒数" min="0.05" max="10" step="0.05" value="1"><span>秒</span></div><button id="process-loop" type="button">处理并准备试听 ↻</button></div></fieldset>
         <p id="loop-status" class="loop-status" role="status" aria-live="polite">生成音乐后，或从左侧选择已完成的记录，即可处理接缝。</p>
-        <div id="loop-result" hidden><div class="loop-result-heading"><strong>Processed loop</strong><a id="download-loop" class="download-button" download>下载循环 WAV ↓</a></div><p id="loop-meta"></p><audio id="loop-audio" controls loop preload="metadata"></audio><div class="result-controls"><label for="processed-loop-toggle"><input id="processed-loop-toggle" type="checkbox" checked> 循环试听处理结果</label><button id="audition-seam" class="text-button" type="button">从接缝前开始试听 ↻</button></div></div>
+        <div id="loop-result" hidden><div class="loop-result-heading"><strong>Processed loop</strong><button type="button" class="text-button" id="loop-to-a">用此 Loop 作为 A ↓</button><button type="button" class="text-button" id="loop-to-b">用此 Loop 作为 B ↓</button><a id="download-loop" class="download-button" download>下载循环 WAV ↓</a></div><p id="loop-meta"></p><audio id="loop-audio" controls loop preload="metadata"></audio><div class="result-controls"><label for="processed-loop-toggle"><input id="processed-loop-toggle" type="checkbox" checked> 循环试听处理结果</label><button id="audition-seam" class="text-button" type="button">从接缝前开始试听 ↻</button></div></div>
         <p class="loop-caution">重叠会缩短循环时长；不会自动对齐节拍或和声。节奏型音乐建议先试短重叠，氛围音乐可尝试更长重叠。</p>
       </section>
     </section>
+    <section class="bridge-builder panel" aria-labelledby="bridge-heading">
+      <div class="panel-heading"><div><span class="section-index">04 / CONNECT</span><h2 id="bridge-heading">Between two paintings.</h2></div><button id="refresh-sources" class="text-button" type="button">刷新素材 ↻</button></div>
+      <p class="loop-description">选择 A、B，自动截取参考、生成中间音乐并处理两端接缝。使用两段真实音频作为上下文。</p>
+      <form id="bridge-form">
+        <div class="bridge-sources"><div><label for="source-a">From A <span>起点音频</span></label><select id="source-a" required><option value="">加载音频素材…</option></select></div><span class="bridge-arrow" aria-hidden="true">→</span><div><label for="source-b">To B <span>终点音频</span></label><select id="source-b" required><option value="">加载音频素材…</option></select></div></div>
+        <div class="bridge-lengths"><label for="bridge-context">两侧各取 <input id="bridge-context" type="number" min="1" max="20" step="0.5" value="8" required> 秒参考</label><label for="bridge-length">生成中间段 <input id="bridge-length" type="number" min="1" max="120" step="0.5" value="12" required> 秒</label></div>
+        <div id="bridge-timeline" class="bridge-timeline">A 最后 8 秒 → 新音乐 12 秒 → B 最前 8 秒</div>
+        <label for="bridge-direction">Musical direction <span>可选：补充希望如何变化；留空则自动使用通用过渡指令</span></label>
+        <textarea id="bridge-direction" maxlength="8000" rows="2" placeholder="For example: gradually thin the ambient texture, then introduce the ending's piano pulse…"></textarea>
+        <div class="generate-footer"><div><span class="provider-dot"></span> Stable Audio 3 · Inpaint<small>一次生成请求 · 使用 API credits · 失败不会自动重试</small></div><button id="bridge-button" class="generate-button" type="submit" disabled>Generate transition ↗</button></div>
+      </form><p id="bridge-note" class="loop-status" role="status"></p>
+      <p class="loop-caution">生成的是有方向的 A → B 连接段；不自动变成可任意停留的空间循环，也不自动匹配节拍或调性。</p>
+    </section>
+
     <footer class="page-footer"><span>LIVING GALLERY / SOUND STUDIO</span><span>Make a study. Take a listen. Try again.</span></footer>
   </main>
 </body>
