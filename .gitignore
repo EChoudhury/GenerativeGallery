@@ -220,3 +220,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 .env
+
+# Local music studio outputs and generation history
+assets/generated/

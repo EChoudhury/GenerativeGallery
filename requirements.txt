@@ -2,6 +2,8 @@ numpy>=1.26
 scipy>=1.11
 soundfile>=0.12
 sounddevice>=0.4.6
-fastapi
-uvicorn
-numpy
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.9
+requests>=2.31
+python-dotenv>=1.0

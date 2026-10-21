@@ -22,7 +22,8 @@ class StabilityAudioClient:
     BASE_URL = "https://api.stability.ai/v2beta/audio"
 
     def __init__(self, api_key=None, poll_interval=10, timeout=600):
-        load_dotenv()
+        if api_key is None:
+            load_dotenv(Path(__file__).resolve().with_name(".env"))
 
         self.api_key = api_key or os.getenv("STABILITY_API_KEY")
         if not self.api_key:
@@ -38,21 +39,24 @@ class StabilityAudioClient:
         self.timeout = timeout
         self.session = requests.Session()
 
-    def generate(self, prompt, output="output.mp3", duration=30):
+    def generate(self, prompt, output="output.mp3", duration=30, on_status=None):
         """Generate audio from a text prompt."""
+        output_format = Path(output).suffix.lower().lstrip(".")
+        if output_format not in {"mp3", "wav"}:
+            raise ValueError("Output filename must end in .mp3 or .wav.")
         response = requests.post(
             f"{self.BASE_URL}/stable-audio/text-to-audio",
             headers=self.headers,
             files={"none": ""},
             data={
                 "prompt": prompt,
-                "output_format": "mp3",
+                "output_format": output_format,
                 "duration": duration,
             },
             timeout=180,
         )
 
-        return self._wait_for_result(response, output)
+        return self._wait_for_result(response, output, on_status=on_status)
 
     def transition(
         self,
@@ -82,7 +86,7 @@ class StabilityAudioClient:
 
         return self._wait_for_result(response, output)
 
-    def _wait_for_result(self, response, output):
+    def _wait_for_result(self, response, output, on_status=None):
         """Poll the asynchronous generation job and save its audio."""
         if response.status_code != 202:
             raise RuntimeError(
@@ -92,6 +96,8 @@ class StabilityAudioClient:
 
         generation_id = response.json()["id"]
         print(f"Generation started: {generation_id}")
+        if on_status:
+            on_status("generating")
 
         result_url = f"{self.BASE_URL}/results/{generation_id}"
         deadline = time.monotonic() + self.timeout
@@ -110,6 +116,8 @@ class StabilityAudioClient:
                 continue
 
             if result.status_code == 200:
+                if on_status:
+                    on_status("saving")
                 output_path = Path(output)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_bytes(result.content)
