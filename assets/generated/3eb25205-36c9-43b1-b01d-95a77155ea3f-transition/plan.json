@@ -1,0 +1,14 @@
+{
+  "source_a": "/Users/m/Documents/GitHub/GenerativeGallery/assets/generated/076f5577-98dd-41b0-8ca3-08c05e571e5e.wav",
+  "source_b": "/Users/m/Documents/GitHub/GenerativeGallery/assets/generated/5a0c1831-2701-4916-8bb2-67f483d9412c.wav",
+  "sample_rate": 44100,
+  "a_frames": 352800,
+  "b_frames": 352800,
+  "bridge_frames": 1411200,
+  "total_frames": 2116800,
+  "mask_start": 8.0,
+  "mask_end": 40.0,
+  "duration": 48.0,
+  "bridge_seconds": 32.0,
+  "prompt": "Create an instrumental connecting passage in the masked middle interval. Use the supplied opening AND ending audio as musical references. Continue the opening's phrasing, then gradually introduce the ending's timbre, harmonic atmosphere, and rhythmic character. If the rhythms differ, thin the pulse into a sparse shared texture before establishing the ending's groove. Keep perceived loudness and acoustic space continuous. Approach the ending reference naturally. No vocals, dramatic climax, final cadence, fade to silence, or repeating-loop structure.\n\nAdditional musical direction: Create one continuous instrumental transformation between the supplied\nopening and ending audio, using piano and vibraphone as shared musical\nthreads.\n\nRetain a recognizable fragment of the opening's recurring piano figure.\nGradually reduce the eight-to-the-bar bass into fewer, longer notes.\nLet the syncopated right-hand figures become more widely spaced and\nless accented, with softer attacks and longer natural decay.\n\nAllow the muted trumpet to recede. Keep occasional vibraphone tones\npresent, gradually softening their brightness and articulation.\nIntroduce a muted cello beneath the piano, sustaining a warm\nmiddle-to-low register as the active bass pattern dissolves.\n\nMove from an explicit swung pulse toward a spacious, loosely felt pulse.\nReduce note density before relaxing the rhythmic feel, avoiding an abrupt\nswitch from 120 BPM to 56 BPM. Approach the actual phrasing and harmony\nof the ending audio reference.\n\nPreserve harmonic continuity, an intimate room sound, and smooth\nperceived loudness. Let the texture become warmer, more veiled, and\nquieter through overlapping instrumental handovers. No alternating\nsections, unrelated new theme, percussion fill, dramatic climax,\nfade to silence, or final resolving chord."
+}

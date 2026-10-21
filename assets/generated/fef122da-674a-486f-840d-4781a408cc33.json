@@ -1,0 +1,32 @@
+{
+  "id": "fef122da-674a-486f-840d-4781a408cc33",
+  "kind": "bridge",
+  "title": "Mondrian-Boogie-Revival-loop-44100 → 754b73fa-411e-46c2-806d-26a3dcbd94a",
+  "source_a": "generated:Mondrian-Boogie-Revival-loop-44100.wav",
+  "source_b": "generated:754b73fa-411e-46c2-806d-26a3dcbd94ad-loop-220500.wav",
+  "context_seconds": 8.0,
+  "bridge_seconds": 12.0,
+  "prompt": "",
+  "effective_prompt": "Create an instrumental connecting passage in the masked middle interval. Use the supplied opening AND ending audio as musical references. Continue the opening's phrasing, then gradually introduce the ending's timbre, harmonic atmosphere, and rhythmic character. If the rhythms differ, thin the pulse into a sparse shared texture before establishing the ending's groove. Keep perceived loudness and acoustic space continuous. Approach the ending reference naturally. No vocals, dramatic climax, final cadence, fade to silence, or repeating-loop structure.",
+  "duration": 28.0,
+  "output_format": "wav",
+  "loop": false,
+  "status": "completed",
+  "created_at": "2026-10-21T15:09:46.959145+00:00",
+  "audio_url": "/api/audio/fef122da-674a-486f-840d-4781a408cc33",
+  "error": null,
+  "transition_report": {
+    "duration": 28.0,
+    "bridge_seconds": 12.0,
+    "bridge_export_seconds": 12.1,
+    "seam_overlap_seconds": 0.05,
+    "peak_before_gain": 0.953155517578125,
+    "output_gain": 1.0,
+    "middle_rms": 0.0682396859796684,
+    "warnings": [
+      "技术检查不评价音乐匹配度；未自动检测或对齐节拍、调性。"
+    ]
+  },
+  "bridge_url": "/api/audio/fef122da-674a-486f-840d-4781a408cc33/bridge",
+  "completed_at": "2026-10-21T15:09:58.482195+00:00"
+}

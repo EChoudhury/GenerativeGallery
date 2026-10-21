@@ -1,0 +1,12 @@
+{
+  "duration": 24.0,
+  "bridge_seconds": 8.0,
+  "bridge_export_seconds": 8.1,
+  "seam_overlap_seconds": 0.05,
+  "peak_before_gain": 0.94000244140625,
+  "output_gain": 1.0,
+  "middle_rms": 0.12396272516070851,
+  "warnings": [
+    "技术检查不评价音乐匹配度；未自动检测或对齐节拍、调性。"
+  ]
+}

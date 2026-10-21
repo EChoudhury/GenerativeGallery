@@ -1,0 +1,23 @@
+{
+  "id": "e658858d-942f-4f05-9250-1d80b8506b49",
+  "title": "Victory Boogie Woogie",
+  "prompt": "A repeating 16-bar instrumental chamber-jazz loop in 4/4 at 140 BPM, approximately 32 seconds long, inspired by Piet Mondrian's Victory Boogie Woogie. Energetic yet spacious, combining boogie-woogie piano with interlocking minimalist patterns. Playful, alert, and rhythmically alive, with precise articulation and a human sense of swing.\n\nA steady eight-to-the-bar left-hand piano bass establishes a clear rhythmic grid. Short syncopated right-hand figures enter, pause, and reappear with small variations. Muted trumpet contributes warm, compact accents; vibraphone adds bright, clearly defined points of sound. Keep these three instrumental colors distinct and in active conversation.\n\nCreate an asymmetrical balance of repeating cells, displaced accents, brief call-and-response phrases, and occasional cross-rhythms over the stable pulse. Alternate clusters of staccato notes with broader chords. Leave gaps between phrases so the arrangement remains open and breathable.\n\nUse crisp attacks, short decays, lightly textured acoustic timbres, and a clear, intimate room sound. Maintain a stable tonal center with buoyant major and dominant harmonies and passing chromatic tensions. Evoke intersecting streams of city movement through musical rhythm, without literal traffic sounds.\n\nControlled dynamics and moderate bass, comfortable for gallery headphone listening. Instrumental, no vocals, no dramatic buildup, no heavy electronic beat.",
+  "effective_prompt": "A repeating 16-bar instrumental chamber-jazz loop in 4/4 at 140 BPM, approximately 32 seconds long, inspired by Piet Mondrian's Victory Boogie Woogie. Energetic yet spacious, combining boogie-woogie piano with interlocking minimalist patterns. Playful, alert, and rhythmically alive, with precise articulation and a human sense of swing.\n\nA steady eight-to-the-bar left-hand piano bass establishes a clear rhythmic grid. Short syncopated right-hand figures enter, pause, and reappear with small variations. Muted trumpet contributes warm, compact accents; vibraphone adds bright, clearly defined points of sound. Keep these three instrumental colors distinct and in active conversation.\n\nCreate an asymmetrical balance of repeating cells, displaced accents, brief call-and-response phrases, and occasional cross-rhythms over the stable pulse. Alternate clusters of staccato notes with broader chords. Leave gaps between phrases so the arrangement remains open and breathable.\n\nUse crisp attacks, short decays, lightly textured acoustic timbres, and a clear, intimate room sound. Maintain a stable tonal center with buoyant major and dominant harmonies and passing chromatic tensions. Evoke intersecting streams of city movement through musical rhythm, without literal traffic sounds.\n\nControlled dynamics and moderate bass, comfortable for gallery headphone listening. Instrumental, no vocals, no dramatic buildup, no heavy electronic beat.",
+  "duration": 32,
+  "output_format": "wav",
+  "loop": false,
+  "status": "completed",
+  "created_at": "2026-10-21T15:16:00.531757+00:00",
+  "audio_url": "/api/audio/e658858d-942f-4f05-9250-1d80b8506b49",
+  "error": null,
+  "completed_at": "2026-10-21T15:16:05.828093+00:00",
+  "loop_version": {
+    "crossfade_seconds": 1.0,
+    "source_duration": 32.0,
+    "duration": 31.0,
+    "sample_rate": 44100,
+    "channels": 2,
+    "overlap_frames": 44100,
+    "audio_url": "/api/audio/e658858d-942f-4f05-9250-1d80b8506b49/loop/44100"
+  }
+}

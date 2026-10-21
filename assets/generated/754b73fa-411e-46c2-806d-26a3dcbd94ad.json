@@ -1,0 +1,23 @@
+{
+  "id": "754b73fa-411e-46c2-806d-26a3dcbd94ad",
+  "title": "still life Morandi",
+  "prompt": "Intimate instrumental chamber miniature for softly played acoustic piano, viola, and clarinet. Inspired by the quiet concentration of Giorgio Morandi’s still-life paintings: a few ordinary forms, closely arranged, with subtle differences in color, weight, and spacing.\n\nVery slow, around 58 BPM, with flexible human phrasing. Introduce a simple three-note piano motif in the middle register. Repeat it patiently, changing only one note, its spacing, or the harmony underneath on each return. A softly sustained upper clarinet tone provides a quiet center, while warm viola phrases move slowly below it.\n\nRestrained dynamics, rounded attacks, delicate bow texture, and natural piano decay. Warm, muted instrumental colors, occasionally illuminated by a slightly brighter piano note. Mostly gentle consonance with a few lingering seconds and suspensions, creating a faint sense of uncertainty within the stillness.\n\nKeep the arrangement sparse, with short silences between phrases and each instrument clearly audible. Develop through small changes in voicing and instrumental balance. Maintain an intimate scale throughout, ending with a softly unresolved chord fading naturally into the room. Close acoustic recording with modest room resonance. No vocals, percussion, dramatic climax, or orchestral swells.",
+  "effective_prompt": "Intimate instrumental chamber miniature for softly played acoustic piano, viola, and clarinet. Inspired by the quiet concentration of Giorgio Morandi’s still-life paintings: a few ordinary forms, closely arranged, with subtle differences in color, weight, and spacing.\n\nVery slow, around 58 BPM, with flexible human phrasing. Introduce a simple three-note piano motif in the middle register. Repeat it patiently, changing only one note, its spacing, or the harmony underneath on each return. A softly sustained upper clarinet tone provides a quiet center, while warm viola phrases move slowly below it.\n\nRestrained dynamics, rounded attacks, delicate bow texture, and natural piano decay. Warm, muted instrumental colors, occasionally illuminated by a slightly brighter piano note. Mostly gentle consonance with a few lingering seconds and suspensions, creating a faint sense of uncertainty within the stillness.\n\nKeep the arrangement sparse, with short silences between phrases and each instrument clearly audible. Develop through small changes in voicing and instrumental balance. Maintain an intimate scale throughout, ending with a softly unresolved chord fading naturally into the room. Close acoustic recording with modest room resonance. No vocals, percussion, dramatic climax, or orchestral swells.\n\nDesign this as a repeating musical cycle with consistent instrumentation, energy, perceived loudness, and tonal center. Use recurring motifs with subtle internal variation. Begin directly in the established texture or groove. Let the final phrase lead naturally back into the opening phrase. No intro, outro, fade-in, fade-out, dramatic buildup, final resolving chord, or trailing silence.",
+  "duration": 32,
+  "output_format": "wav",
+  "loop": true,
+  "status": "completed",
+  "created_at": "2026-10-21T11:20:21.769188+00:00",
+  "audio_url": "/api/audio/754b73fa-411e-46c2-806d-26a3dcbd94ad",
+  "error": null,
+  "completed_at": "2026-10-21T11:20:28.300767+00:00",
+  "loop_version": {
+    "crossfade_seconds": 5.0,
+    "source_duration": 32.0,
+    "duration": 27.0,
+    "sample_rate": 44100,
+    "channels": 2,
+    "overlap_frames": 220500,
+    "audio_url": "/api/audio/754b73fa-411e-46c2-806d-26a3dcbd94ad/loop/220500"
+  }
+}

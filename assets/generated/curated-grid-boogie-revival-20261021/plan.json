@@ -1,0 +1,18 @@
+{
+  "created_at": "2026-10-21T15:11:46.444310+00:00",
+  "source": "/Users/m/Documents/GitHub/GenerativeGallery/assets/generated/fef122da-674a-486f-840d-4781a408cc33.wav",
+  "excerpt_seconds": [
+    8.0,
+    20.0
+  ],
+  "endpoint_a": "/Users/m/Documents/GitHub/GenerativeGallery/assets/generated/Mondrian-Boogie-Revival-loop-44100.wav",
+  "endpoint_b": "/Users/m/Documents/GitHub/GenerativeGallery/assets/generated/754b73fa-411e-46c2-806d-26a3dcbd94ad-loop-220500.wav",
+  "method": "audio-to-audio variations of the curated middle, biased toward each endpoint",
+  "strength": 0.4,
+  "loop_overlap_seconds": 0.25,
+  "prompts": {
+    "1": "A repeating instrumental chamber-jazz texture halfway between the supplied quiet chamber excerpt and an energetic Mondrian boogie-woogie piano piece. Preserve the reference's recognizable piano phrasing, harmonic atmosphere and intimate acoustic space. Introduce a gentle regular pulse around 90 BPM, lightly swung short piano figures and a restrained repeating left-hand bass. A few warm muted-trumpet accents and rounded vibraphone notes answer the piano. Moderate activity with audible space between motifs; more rhythmic than the reference but less busy than full boogie-woogie. A stable texture throughout, no abrupt switches between styles. Warm acoustic timbres, controlled dynamics, no percussion or vocals, no intro, outro, final cadence, dramatic build or fade. Begin and end within the same ongoing groove, suitable for circular looping.",
+    "3": "A repeating intimate ambient chamber texture halfway between the supplied chamber excerpt and the patient stillness of a Morandi still life. Preserve the reference's recognizable piano phrasing, harmonic atmosphere and intimate acoustic space. Relax the pulse toward 65 BPM, progressively space out the piano's small recurring figures, with soft warm sustained viola and a few rounded clarinet tones. Very restrained activity with generous space between notes, gently suspended consonant harmonies and soft natural decay. A stable texture throughout, no abrupt switches between styles. Quiet even dynamics, no percussion or vocals, no intro, outro, final cadence, dramatic build or fade. Begin and end within the same ongoing texture, suitable for circular looping."
+  },
+  "cells": []
+}

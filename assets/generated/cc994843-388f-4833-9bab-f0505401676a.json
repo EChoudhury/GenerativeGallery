@@ -1,0 +1,15 @@
+{
+  "id": "cc994843-388f-4833-9bab-f0505401676a",
+  "title": "Mondrian Piano",
+  "prompt": "TrackType: Instrument. Solo acoustic piano only, unaccompanied. Playful sparse chamber-jazz piano, crisp short attacks and natural brief decays. Tiny one-to-three-note cells in the middle and upper register, light syncopation, small angular jumps, clipped repeated notes and ample rests. Clear quarter-note pulse with subtle human swing. A light repeating C and G left-hand figure, never a dense bass line. Moderate rhythmic activity, no continuous runs. No percussion, trumpet, vibraphone, strings or pads.\n\n120 BPM, 4/4, eight bars, exactly 16 seconds. Inspired by the small interlocking geometric fragments and open white spaces of Piet Mondrian's Victory Boogie Woogie. A fixed C tonal center, using C, E, G and A; no chord progression or modulation. Stable tempo and intimate dry acoustic recording, restrained dynamics. Begin immediately on the first downbeat within an ongoing repeating texture. No intro, outro, fade, final cadence, dramatic build, vocals or accompanying ensemble. A sparse part intended to layer with other instruments. Keep the pulse steady throughout.",
+  "effective_prompt": "TrackType: Instrument. Solo acoustic piano only, unaccompanied. Playful sparse chamber-jazz piano, crisp short attacks and natural brief decays. Tiny one-to-three-note cells in the middle and upper register, light syncopation, small angular jumps, clipped repeated notes and ample rests. Clear quarter-note pulse with subtle human swing. A light repeating C and G left-hand figure, never a dense bass line. Moderate rhythmic activity, no continuous runs. No percussion, trumpet, vibraphone, strings or pads.\n\n120 BPM, 4/4, eight bars, exactly 16 seconds. Inspired by the small interlocking geometric fragments and open white spaces of Piet Mondrian's Victory Boogie Woogie. A fixed C tonal center, using C, E, G and A; no chord progression or modulation. Stable tempo and intimate dry acoustic recording, restrained dynamics. Begin immediately on the first downbeat within an ongoing repeating texture. No intro, outro, fade, final cadence, dramatic build, vocals or accompanying ensemble. A sparse part intended to layer with other instruments. Keep the pulse steady throughout.\n\nDesign this as a repeating musical cycle with consistent instrumentation, energy, perceived loudness, and tonal center. Use recurring motifs with subtle internal variation. Begin directly in the established texture or groove. Let the final phrase lead naturally back into the opening phrase. No intro, outro, fade-in, fade-out, dramatic buildup, final resolving chord, or trailing silence.",
+  "duration": 16,
+  "output_format": "wav",
+  "loop": true,
+  "status": "completed",
+  "created_at": "2026-10-21T15:51:58.533106+00:00",
+  "audio_url": "/api/audio/cc994843-388f-4833-9bab-f0505401676a",
+  "error": null,
+  "filename": "Mondrian Piano-001.wav",
+  "completed_at": "2026-10-21T15:52:05.133204+00:00"
+}
