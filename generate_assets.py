@@ -64,6 +64,7 @@ class StabilityAudioClient:
         prompt,
         output="transition.mp3",
         duration=30,
+        strength=0.4,
     ):
         """Transform an input audio file according to a text prompt."""
         input_path = Path(input_audio)
@@ -80,6 +81,7 @@ class StabilityAudioClient:
                     "prompt": prompt,
                     "output_format": "mp3",
                     "duration": duration,
+                    "strength": strength,
                 },
                 timeout=180,
             )
@@ -154,6 +156,7 @@ def main():
     transition_parser.add_argument("--prompt", required=True)
     transition_parser.add_argument("--output", default="transition.mp3")
     transition_parser.add_argument("--duration", type=int, default=30)
+    transition_parser.add_argument("--strength", type=float, default=0.4)
 
     args = parser.parse_args()
 
@@ -164,7 +167,7 @@ def main():
             client.generate(args.prompt, args.output, args.duration)
         else:
             client.transition(
-                args.input, args.prompt, args.output, args.duration
+                args.input, args.prompt, args.output, args.duration, args.strength
             )
 
     except (
