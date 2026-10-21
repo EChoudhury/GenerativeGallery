@@ -2,38 +2,44 @@
 Gallery Grid Audio Server
 
 Install:
-    pip install fastapi uvicorn numpy soundfile scipy
+    pip install fastapi uvicorn
 
 Run:
     uvicorn server:app --host 192.168.125.250 --port 8000
 
 Audio files:
-    audio/cell_0_0.wav ... audio/cell_4_4.wav
+    audio/cell_0.mp3
+    audio/cell_1.mp3
+    audio/cell_2.mp3
+    audio/cell_3.mp3
+    audio/cell_4.mp3
+    audio/drone.mp3
 
 API:
     POST /position
         {"x": 2.1, "y": 3.4}
 
-    GET /audio
-        Continuous raw PCM audio stream (stereo, 44.1 kHz, float32)
+    GET /audio/{col}
+        Streams the MP3 associated with a column.
+
+    GET /audio/drone
+        Streams the continuous background drone.
 
     GET /health
-        Reports loaded and missing audio files.
+        Reports available and missing audio files.
 
 Coordinates are in the range [0, 5].
-The 5x5 cells are centered at (0.5, 0.5), (1.5, 0.5), etc.
-Nearby cells are blended using inverse-distance weighting.
+The five columns are centered at x = 0.5, 1.5, 2.5, 3.5, 4.5.
+The Y coordinate is ignored when selecting audio.
+
+Crossfading and drone mixing happen in the browser using the Web Audio API.
 """
 
 from pathlib import Path
 from threading import Lock
-from typing import Generator
 
-import numpy as np
-import soundfile as sf
-from scipy.signal import resample_poly
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 
@@ -42,22 +48,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------
 
 GRID_SIZE = 5
-SAMPLE_RATE = 44100
-CHANNELS = 2
-CHUNK_SECONDS = 0.1
-CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_SECONDS)
-
 AUDIO_DIR = Path("audio")
-
-# Higher values make the closest cell dominate more strongly.
-DISTANCE_POWER = 2.0
-
-# Prevents division by zero when a person is exactly at a cell center.
-DISTANCE_EPSILON = 0.05
-
-# A short smoothing time helps avoid sudden changes in audio level.
-WEIGHT_SMOOTHING = 0.15
-
 
 app = FastAPI(title="Gallery Grid Audio Server")
 
@@ -72,234 +63,56 @@ class Position(BaseModel):
 
 
 position_lock = Lock()
-current_position = np.array([2.5, 2.5], dtype=np.float64)
-
-audio_buffers: dict[tuple[int, int], np.ndarray] = {}
-audio_lengths: dict[tuple[int, int], int] = {}
-missing_files: list[str] = []
+current_position = {"x": 2.5, "y": 2.5}
 
 
 # ---------------------------------------------------------------------
-# Audio loading
+# Audio file availability
 # ---------------------------------------------------------------------
 
-def convert_to_stereo(audio: np.ndarray) -> np.ndarray:
-    """Convert mono or multichannel audio into stereo."""
-    if audio.ndim == 1:
-        audio = np.column_stack((audio, audio))
-    elif audio.shape[1] == 1:
-        audio = np.repeat(audio, 2, axis=1)
-    elif audio.shape[1] > 2:
-        audio = audio[:, :2]
-
-    return audio.astype(np.float32, copy=False)
+def get_audio_path(col: int) -> Path:
+    """Return the MP3 file for a column."""
+    return AUDIO_DIR / f"cell_{col}.mp3"
 
 
-def resample_audio(
-    audio: np.ndarray,
-    source_rate: int,
-) -> np.ndarray:
-    """Resample audio to the server's sample rate."""
-    if source_rate == SAMPLE_RATE:
-        return audio
-
-    from math import gcd
-
-    divisor = gcd(SAMPLE_RATE, source_rate)
-
-    return resample_poly(
-        audio,
-        SAMPLE_RATE // divisor,
-        source_rate // divisor,
-        axis=0,
-    ).astype(np.float32)
+def get_drone_path() -> Path:
+    """Return the shared drone MP3."""
+    return AUDIO_DIR / "drone.mp3"
 
 
-def load_audio_files() -> None:
-    """Load all 25 grid-cell audio files into memory."""
+def get_available_columns() -> list[int]:
+    """Return the columns whose MP3 files exist."""
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-    for row in range(GRID_SIZE):
-        for col in range(GRID_SIZE):
-            key = (col, row)
-            path = AUDIO_DIR / f"cell_{col}_{row}.wav"
-
-            if not path.exists():
-                missing_files.append(str(path))
-                continue
-
-            try:
-                audio, source_rate = sf.read(
-                    str(path),
-                    dtype="float32",
-                    always_2d=True,
-                )
-
-                audio = convert_to_stereo(audio)
-                audio = resample_audio(audio, source_rate)
-
-                if len(audio) == 0:
-                    missing_files.append(f"{path} (empty file)")
-                    continue
-
-                audio_buffers[key] = audio
-                audio_lengths[key] = len(audio)
-
-                print(
-                    f"Loaded {path}: "
-                    f"{len(audio) / SAMPLE_RATE:.1f}s"
-                )
-
-            except Exception as exc:
-                print(f"Could not load {path}: {exc}")
-                missing_files.append(f"{path} (load error)")
+    return [
+        col
+        for col in range(GRID_SIZE)
+        if get_audio_path(col).is_file()
+    ]
 
 
 @app.on_event("startup")
 def startup() -> None:
-    load_audio_files()
+    """Report available and missing audio files."""
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+    for col in range(GRID_SIZE):
+        path = get_audio_path(col)
 
-# ---------------------------------------------------------------------
-# Position and blending
-# ---------------------------------------------------------------------
+        if path.is_file():
+            print(f"Found audio: {path}")
+        else:
+            print(f"Missing audio file: {path}")
 
-def get_position() -> np.ndarray:
-    with position_lock:
-        return current_position.copy()
+    drone_path = get_drone_path()
 
-
-def calculate_weights(position: np.ndarray) -> dict:
-    """
-    Calculate the influence of each audio cell.
-
-    Each cell is centered at (col + 0.5, row + 0.5).
-    Nearby cells receive more weight; all weights sum to 1.
-    """
-    distances = {}
-
-    for col, row in audio_buffers:
-        center_x = col + 0.5
-        center_y = row + 0.5
-
-        dx = position[0] - center_x
-        dy = position[1] - center_y
-
-        distances[(col, row)] = np.sqrt(dx * dx + dy * dy)
-
-    if not distances:
-        return {}
-
-    # Inverse-distance weighting.
-    raw_weights = {
-        key: 1.0 / (
-            (distance + DISTANCE_EPSILON) ** DISTANCE_POWER
+    if drone_path.is_file():
+        print(f"Found background drone: {drone_path}")
+    else:
+        print(
+            f"Missing background drone: {drone_path}. "
+            "The gallery will still work without it."
         )
-        for key, distance in distances.items()
-    }
-
-    total = sum(raw_weights.values())
-
-    if total <= 0:
-        return {}
-
-    return {
-        key: weight / total
-        for key, weight in raw_weights.items()
-    }
-
-
-# ---------------------------------------------------------------------
-# Continuous audio generation
-# ---------------------------------------------------------------------
-
-def get_audio_chunk(
-    playheads: dict[tuple[int, int], int],
-    smoothed_weights: dict[tuple[int, int], float],
-    target_weights: dict[tuple[int, int], float],
-) -> np.ndarray:
-    """
-    Mix one chunk from the grid's audio files.
-
-    Each audio file loops independently. Its playhead advances
-    continuously, even as the listener moves between cells.
-    """
-    output = np.zeros((CHUNK_SIZE, CHANNELS), dtype=np.float32)
-
-    # Smooth the weights to avoid abrupt transitions.
-    for key in audio_buffers:
-        previous = smoothed_weights.get(key, 0.0)
-        target = target_weights.get(key, 0.0)
-
-        smoothed_weights[key] = (
-            previous
-            + WEIGHT_SMOOTHING * (target - previous)
-        )
-
-    # Renormalize to preserve a stable overall gain.
-    weight_sum = sum(smoothed_weights.values())
-
-    if weight_sum > 0:
-        for key in smoothed_weights:
-            smoothed_weights[key] /= weight_sum
-
-    for key, audio in audio_buffers.items():
-        weight = smoothed_weights.get(key, 0.0)
-
-        if weight < 0.0001:
-            continue
-
-        audio_length = audio_lengths[key]
-        start = playheads.get(key, 0)
-
-        # Read a chunk, wrapping around the end of the file.
-        indices = (start + np.arange(CHUNK_SIZE)) % audio_length
-        chunk = audio[indices]
-
-        output += chunk * weight
-
-        playheads[key] = (start + CHUNK_SIZE) % audio_length
-
-    # Keep the output within a safe floating-point range.
-    # Soft clipping avoids harsh distortion if several layers overlap.
-    output = np.tanh(output * 0.9).astype(np.float32)
-
-    return output
-
-
-def audio_stream() -> Generator[bytes, None, None]:
-    """
-    Yield continuous stereo float32 PCM chunks.
-
-    The client must interpret this as raw PCM:
-        sample rate: 44100 Hz
-        channels: 2
-        format: float32 little-endian
-    """
-    playheads = {
-        key: 0
-        for key in audio_buffers
-    }
-
-    smoothed_weights = {
-        key: 0.0
-        for key in audio_buffers
-    }
-
-    target_weights = calculate_weights(get_position())
-
-    while True:
-        position = get_position()
-        target_weights = calculate_weights(position)
-
-        chunk = get_audio_chunk(
-            playheads,
-            smoothed_weights,
-            target_weights,
-        )
-
-        # Explicitly use little-endian float32.
-        yield chunk.astype("<f4", copy=False).tobytes()
 
 
 # ---------------------------------------------------------------------
@@ -308,14 +121,12 @@ def audio_stream() -> Generator[bytes, None, None]:
 
 @app.post("/position")
 def update_position(position: Position) -> dict:
-    """Update the listener's current position in the room."""
-    global current_position
-
+    """Update the listener's position in the room."""
     with position_lock:
-        current_position = np.array(
-            [position.x, position.y],
-            dtype=np.float64,
-        )
+        current_position["x"] = position.x
+        current_position["y"] = position.y
+
+    col = min(GRID_SIZE - 1, int(position.x))
 
     return {
         "status": "ok",
@@ -323,158 +134,696 @@ def update_position(position: Position) -> dict:
             "x": position.x,
             "y": position.y,
         },
+        "column": col,
+        "audio_url": f"/audio/{col}",
     }
 
 
-@app.get("/audio")
-def stream_audio() -> StreamingResponse:
-    """
-    Stream continuous raw PCM audio.
-
-    This is not a WAV file: it has no file header because the stream
-    is intended to remain open indefinitely.
-    """
-    if not audio_buffers:
+@app.get("/audio/{col}")
+def stream_audio(col: int) -> FileResponse:
+    """Stream the MP3 associated with a column."""
+    if col < 0 or col >= GRID_SIZE:
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "No audio files are loaded. Add WAV files to the "
-                "'audio' directory and restart the server."
-            ),
+            status_code=404,
+            detail="Invalid column",
         )
 
-    return StreamingResponse(
-        audio_stream(),
-        media_type="application/octet-stream",
+    path = get_audio_path(col)
+
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Audio file not found: {path.name}",
+        )
+
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
         headers={
-            "Cache-Control": "no-cache, no-store",
-            "X-Audio-Sample-Rate": str(SAMPLE_RATE),
-            "X-Audio-Channels": str(CHANNELS),
-            "X-Audio-Format": "float32-le",
+            "Cache-Control": "no-cache",
         },
+        filename=None,
+    )
+
+
+@app.get("/audio/drone")
+def stream_drone() -> FileResponse:
+    """Stream the shared background drone."""
+    path = get_drone_path()
+
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Background drone not found: drone.mp3",
+        )
+
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-cache",
+        },
+        filename=None,
     )
 
 
 @app.get("/health")
 def health() -> dict:
-    """Check which grid audio files loaded successfully."""
+    """Report available column tracks and drone."""
+    available = get_available_columns()
+
+    missing = [
+        str(get_audio_path(col))
+        for col in range(GRID_SIZE)
+        if col not in available
+    ]
+
+    drone_available = get_drone_path().is_file()
+
+    with position_lock:
+        position = dict(current_position)
+
     return {
-        "status": "ok" if audio_buffers else "no_audio",
-        "loaded_cells": len(audio_buffers),
-        "missing_files": missing_files,
-        "sample_rate": SAMPLE_RATE,
-        "channels": CHANNELS,
-        "position": get_position().tolist(),
+        "status": "ok" if available else "no_audio",
+        "loaded_columns": available,
+        "loaded_count": len(available),
+        "missing_files": missing,
+        "drone_available": drone_available,
+        "drone_file": str(get_drone_path()),
+        "position": position,
+        "current_column": min(
+            GRID_SIZE - 1,
+            int(position["x"]),
+        ),
     }
 
 
+# ---------------------------------------------------------------------
+# Browser test page
+# ---------------------------------------------------------------------
+
 @app.get("/")
 def home() -> HTMLResponse:
-    """Serve a simple test page with a position slider."""
+    """Serve the interactive gallery test page."""
     return HTMLResponse(
         """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
     <title>Gallery Audio Grid</title>
+
     <style>
         body {
             font-family: sans-serif;
-            max-width: 650px;
+            max-width: 700px;
             margin: 40px auto;
             padding: 0 20px;
         }
-        .control { margin: 24px 0; }
-        input { width: 100%; }
-        button { padding: 10px 16px; }
+
+        .control {
+            margin: 24px 0;
+        }
+
+        input[type="range"] {
+            width: 100%;
+        }
+
+        button {
+            padding: 10px 16px;
+            cursor: pointer;
+        }
+
         #grid {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
             gap: 5px;
             margin-top: 20px;
         }
+
         .cell {
             background: #eee;
             padding: 20px 5px;
             text-align: center;
             border-radius: 5px;
         }
-        .active { background: #a7d8ff; }
+
+        .active {
+            background: #a7d8ff;
+        }
+
+        #status {
+            margin-top: 20px;
+            line-height: 1.5;
+        }
+
+        .value {
+            font-weight: bold;
+        }
+
+        .note {
+            color: #555;
+            font-size: 0.9rem;
+        }
     </style>
 </head>
+
 <body>
     <h1>Gallery Audio Grid</h1>
-    <p>Move around the grid to blend the audio layers.</p>
 
-    <button id="start">Start audio stream</button>
+    <p>
+        Move horizontally across the grid to switch soundscapes.
+        The background drone continues while the column tracks
+        crossfade. The Y coordinate does not affect the audio.
+    </p>
+
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop audio</button>
 
     <div class="control">
-        <label for="x">X position: <span id="xvalue">2.5</span></label>
-        <input id="x" type="range" min="0" max="5"
-               step="0.05" value="2.5">
+        <label for="x">
+            X position:
+            <span class="value" id="xvalue">2.50</span>
+        </label>
+
+        <input
+            id="x"
+            type="range"
+            min="0"
+            max="5"
+            step="0.05"
+            value="2.5"
+        >
     </div>
 
     <div class="control">
-        <label for="y">Y position: <span id="yvalue">2.5</span></label>
-        <input id="y" type="range" min="0" max="5"
-               step="0.05" value="2.5">
+        <label for="y">
+            Y position:
+            <span class="value" id="yvalue">2.50</span>
+        </label>
+
+        <input
+            id="y"
+            type="range"
+            min="0"
+            max="5"
+            step="0.05"
+            value="2.5"
+        >
     </div>
 
-    <div id="status">Audio is stopped.</div>
+    <div class="control">
+        <label for="crossfade">
+            Crossfade duration:
+            <span class="value" id="crossfadeValue">3.0</span>
+            seconds
+        </label>
+
+        <input
+            id="crossfade"
+            type="range"
+            min="0.25"
+            max="10"
+            step="0.25"
+            value="3"
+        >
+
+        <p class="note">
+            Shorter transitions feel more immediate. Longer
+            transitions create a more gradual change.
+        </p>
+    </div>
+
+    <div class="control">
+        <label for="droneVolume">
+            Drone volume:
+            <span class="value" id="droneValue">15</span>%
+        </label>
+
+        <input
+            id="droneVolume"
+            type="range"
+            min="0"
+            max="50"
+            step="1"
+            value="15"
+        >
+    </div>
+
+    <div class="control">
+        <label for="trackVolume">
+            Soundscape volume:
+            <span class="value" id="trackValue">100</span>%
+        </label>
+
+        <input
+            id="trackVolume"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value="100"
+        >
+    </div>
+
+    <div id="status">Audio stopped.</div>
+
     <div id="grid"></div>
 
     <script>
         const xSlider = document.getElementById("x");
         const ySlider = document.getElementById("y");
-        const grid = document.getElementById("grid");
+        const crossfadeSlider = document.getElementById("crossfade");
+        const droneSlider = document.getElementById("droneVolume");
+        const trackSlider = document.getElementById("trackVolume");
+
         const status = document.getElementById("status");
+        const startButton = document.getElementById("start");
+        const stopButton = document.getElementById("stop");
+
+        let audioContext = null;
+        let players = [];
+        let dronePlayer = null;
+
+        let activeIndex = 0;
+        let currentColumn = null;
+        let audioStarted = false;
+
+        // Incremented on each transition to invalidate stale loads.
+        let transitionId = 0;
+
+        // Currently scheduled transition cleanup.
+        let transitionCleanup = null;
+
+        // -----------------------------------------------------------------
+        // Grid
+        // -----------------------------------------------------------------
 
         for (let row = 4; row >= 0; row--) {
             for (let col = 0; col < 5; col++) {
                 const cell = document.createElement("div");
+
                 cell.className = "cell";
                 cell.id = `cell-${col}-${row}`;
                 cell.textContent = `${col}, ${row}`;
-                grid.appendChild(cell);
+
+                document.getElementById("grid").appendChild(cell);
             }
         }
+
+        function columnFromX(x) {
+            return Math.min(4, Math.floor(x));
+        }
+
+        function updateGrid(col) {
+            document.querySelectorAll(".cell").forEach(cell => {
+                cell.classList.remove("active");
+            });
+
+            for (let row = 0; row < 5; row++) {
+                document
+                    .getElementById(`cell-${col}-${row}`)
+                    .classList.add("active");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Web Audio setup
+        // -----------------------------------------------------------------
+
+        function createPlayer() {
+            const audio = new Audio();
+            audio.preload = "none";
+            audio.loop = true;
+            audio.crossOrigin = "anonymous";
+
+            const source = audioContext.createMediaElementSource(audio);
+            const gain = audioContext.createGain();
+
+            source.connect(gain);
+            gain.connect(audioContext.destination);
+
+            return {
+                audio,
+                gain,
+                source,
+                targetColumn: null
+            };
+        }
+
+        function initializeAudio() {
+            if (audioContext) return;
+
+            audioContext = new AudioContext();
+
+            players = [
+                createPlayer(),
+                createPlayer()
+            ];
+
+            dronePlayer = createPlayer();
+
+            players.forEach(player => {
+                player.gain.gain.value = 0;
+            });
+
+            dronePlayer.gain.gain.value =
+                Number(droneSlider.value) / 100;
+        }
+
+        // -----------------------------------------------------------------
+        // Transition handling
+        // -----------------------------------------------------------------
+
+        function cancelTransitionCleanup() {
+            if (transitionCleanup !== null) {
+                clearTimeout(transitionCleanup);
+                transitionCleanup = null;
+            }
+        }
+
+        function rampGain(gainNode, target, now, duration) {
+            const param = gainNode.gain;
+
+            // Continue smoothly from the current scheduled value.
+            const currentValue = param.value;
+
+            param.cancelScheduledValues(now);
+            param.setValueAtTime(currentValue, now);
+
+            if (duration <= 0.01) {
+                param.setValueAtTime(target, now);
+            } else {
+                param.linearRampToValueAtTime(
+                    target,
+                    now + duration
+                );
+            }
+        }
+
+        async function switchAudio(col, immediate = false) {
+            if (!audioStarted) return;
+
+            if (
+                col === currentColumn &&
+                players[activeIndex].targetColumn === col
+            ) {
+                return;
+            }
+
+            const id = ++transitionId;
+
+            cancelTransitionCleanup();
+
+            const oldPlayer = players[activeIndex];
+            const nextIndex = 1 - activeIndex;
+            const nextPlayer = players[nextIndex];
+
+            currentColumn = col;
+            nextPlayer.targetColumn = col;
+
+            const duration = immediate
+                ? 0
+                : Number(crossfadeSlider.value);
+
+            status.textContent =
+                `Loading soundscape for column ${col}...`;
+
+            // Prepare the inactive player at zero gain.
+            nextPlayer.gain.gain.cancelScheduledValues(
+                audioContext.currentTime
+            );
+            nextPlayer.gain.gain.setValueAtTime(
+                0,
+                audioContext.currentTime
+            );
+
+            nextPlayer.audio.pause();
+            nextPlayer.audio.src = `/audio/${col}`;
+            nextPlayer.audio.load();
+
+            try {
+                await nextPlayer.audio.play();
+
+                // A newer transition may have started during loading.
+                if (id !== transitionId) {
+                    nextPlayer.audio.pause();
+                    return;
+                }
+
+                const now = audioContext.currentTime;
+
+                const oldTarget = oldPlayer.targetColumn;
+
+                rampGain(
+                    nextPlayer.gain,
+                    Number(trackSlider.value) / 100,
+                    now,
+                    duration
+                );
+
+                if (oldTarget !== null && !oldPlayer.audio.paused) {
+                    rampGain(
+                        oldPlayer.gain,
+                        0,
+                        now,
+                        duration
+                    );
+                }
+
+                activeIndex = nextIndex;
+
+                transitionCleanup = setTimeout(() => {
+                    if (id !== transitionId) return;
+
+                    if (oldTarget !== null) {
+                        oldPlayer.audio.pause();
+                        oldPlayer.audio.removeAttribute("src");
+                        oldPlayer.audio.load();
+                        oldPlayer.targetColumn = null;
+                    }
+
+                    transitionCleanup = null;
+                }, duration * 1000 + 150);
+
+                status.textContent =
+                    `Playing column ${col}. ` +
+                    `Crossfade: ${duration.toFixed(2)} seconds.`;
+
+            } catch (error) {
+                if (id !== transitionId) return;
+
+                status.textContent =
+                    `Could not play column ${col}: ${error.message}`;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Drone
+        // -----------------------------------------------------------------
+
+        async function startDrone() {
+            dronePlayer.audio.src = "/audio/drone";
+            dronePlayer.audio.load();
+
+            try {
+                await dronePlayer.audio.play();
+
+                const now = audioContext.currentTime;
+
+                dronePlayer.gain.gain.cancelScheduledValues(now);
+                dronePlayer.gain.gain.setValueAtTime(0, now);
+                dronePlayer.gain.gain.linearRampToValueAtTime(
+                    Number(droneSlider.value) / 100,
+                    now + 1.5
+                );
+
+                return true;
+            } catch (error) {
+                console.warn("Background drone unavailable:", error);
+                status.textContent =
+                    "Drone unavailable; continuing without it.";
+
+                return false;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Position updates
+        // -----------------------------------------------------------------
 
         async function sendPosition() {
             const x = Number(xSlider.value);
             const y = Number(ySlider.value);
+            const col = columnFromX(x);
 
-            document.getElementById("xvalue").textContent = x.toFixed(2);
-            document.getElementById("yvalue").textContent = y.toFixed(2);
+            document.getElementById("xvalue").textContent =
+                x.toFixed(2);
 
-            await fetch("/position", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({x, y})
-            });
+            document.getElementById("yvalue").textContent =
+                y.toFixed(2);
 
-            document.querySelectorAll(".cell").forEach(el => {
-                el.classList.remove("active");
-            });
+            updateGrid(col);
 
-            const col = Math.min(4, Math.floor(x));
-            const row = Math.min(4, Math.floor(y));
-            document.getElementById(`cell-${col}-${row}`)
-                .classList.add("active");
+            try {
+                const response = await fetch("/position", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ x, y })
+                });
+
+                if (!response.ok) {
+                    throw new Error("Position update failed");
+                }
+            } catch (error) {
+                status.textContent =
+                    "Could not update position: " + error.message;
+                return;
+            }
+
+            // Y does not affect the audio selection.
+            if (col === currentColumn) return;
+
+            if (!audioStarted) {
+                currentColumn = col;
+                status.textContent = `Column ${col}: ready to play`;
+                return;
+            }
+
+            await switchAudio(col);
         }
+
+        // -----------------------------------------------------------------
+        // Controls
+        // -----------------------------------------------------------------
+
+        startButton.addEventListener("click", async () => {
+            initializeAudio();
+
+            try {
+                await audioContext.resume();
+
+                audioStarted = true;
+                startButton.disabled = true;
+                stopButton.disabled = false;
+
+                const col = columnFromX(Number(xSlider.value));
+
+                // Start the drone independently of the soundscape.
+                await startDrone();
+
+                // Start the first track without crossfading from silence.
+                currentColumn = null;
+                await switchAudio(col, true);
+
+            } catch (error) {
+                status.textContent =
+                    "Could not start audio: " + error.message;
+
+                startButton.disabled = false;
+                stopButton.disabled = true;
+            }
+        });
+
+        stopButton.addEventListener("click", () => {
+            transitionId++;
+            cancelTransitionCleanup();
+
+            audioStarted = false;
+
+            players.forEach(player => {
+                player.audio.pause();
+                player.audio.removeAttribute("src");
+                player.audio.load();
+
+                player.gain.gain.cancelScheduledValues(
+                    audioContext.currentTime
+                );
+                player.gain.gain.setValueAtTime(
+                    0,
+                    audioContext.currentTime
+                );
+
+                player.targetColumn = null;
+            });
+
+            if (dronePlayer) {
+                dronePlayer.audio.pause();
+                dronePlayer.audio.removeAttribute("src");
+                dronePlayer.audio.load();
+
+                dronePlayer.gain.gain.cancelScheduledValues(
+                    audioContext.currentTime
+                );
+                dronePlayer.gain.gain.setValueAtTime(
+                    0,
+                    audioContext.currentTime
+                );
+            }
+
+            currentColumn = null;
+            activeIndex = 0;
+
+            startButton.disabled = false;
+            stopButton.disabled = true;
+
+            status.textContent = "Audio stopped.";
+        });
+
+        crossfadeSlider.addEventListener("input", () => {
+            document.getElementById("crossfadeValue").textContent =
+                Number(crossfadeSlider.value).toFixed(2);
+        });
+
+        droneSlider.addEventListener("input", () => {
+            const volume = Number(droneSlider.value) / 100;
+
+            document.getElementById("droneValue").textContent =
+                droneSlider.value;
+
+            if (dronePlayer && audioStarted) {
+                const now = audioContext.currentTime;
+
+                rampGain(
+                    dronePlayer.gain,
+                    volume,
+                    now,
+                    0.1
+                );
+            }
+        });
+
+        trackSlider.addEventListener("input", () => {
+            document.getElementById("trackValue").textContent =
+                trackSlider.value;
+
+            if (!audioStarted) return;
+
+            const now = audioContext.currentTime;
+            const target = Number(trackSlider.value) / 100;
+
+            players.forEach(player => {
+                if (
+                    player.targetColumn !== null &&
+                    !player.audio.paused
+                ) {
+                    rampGain(player.gain, target, now, 0.1);
+                }
+            });
+        });
 
         xSlider.addEventListener("input", sendPosition);
         ySlider.addEventListener("input", sendPosition);
 
-        document.getElementById("start").addEventListener("click", () => {
-            status.textContent =
-                "The raw PCM endpoint is /audio. A PCM-capable audio client is required.";
-            window.open("/audio", "_blank");
-        });
-
+        // Initialize position and grid without starting playback.
         sendPosition();
     </script>
 </body>
 </html>
         """
     )
+
