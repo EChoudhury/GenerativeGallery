@@ -1,3 +1,4 @@
+
 """
 server.py
 
@@ -9,28 +10,15 @@ Gallery Grid Audio Server:
 - Publishes each generated cell as soon as it is ready.
 - Live browser crossfade when the currently playing cell is updated.
 - Four Raspberry Pi GPIO buttons for live emotion parameter control.
+- Automatically generates a new soundscape when intensity_a remains
+  unchanged for five seconds.
+- Queues subsequent automatic generation if intensity changes during a job.
 
 Install:
     pip install fastapi uvicorn bleak requests python-dotenv gpiozero
 
 Run:
     uvicorn server:app --host 0.0.0.0 --port 8000
-
-Expected original audio files:
-    audio/cell_0.mp3
-    audio/cell_1.mp3
-    audio/cell_2.mp3
-    audio/cell_3.mp3
-    audio/cell_4.mp3
-    audio/drone.mp3
-
-GPIO buttons (BCM numbering):
-    Button 1: GPIO 17 (physical pin 11) -> intensity_a = 1.0
-    Button 2: GPIO 27 (physical pin 13) -> intensity_a = 0.0
-    Button 3: GPIO 22 (physical pin 15) -> valence_a = 1.0
-    Button 4: GPIO 23 (physical pin 16) -> valence_a = 0.0
-
-Connect each normally open button between its GPIO pin and GND.
 
 Environment:
     STABILITY_API_KEY=your_api_key
@@ -76,6 +64,10 @@ BEACON_B_ADDRESS = os.getenv("BEACON_B_ADDRESS", "").strip().lower()
 
 GENERATION_DURATION_SECONDS = 30
 GENERATION_STRENGTH = 0.80
+
+# Automatically generate after intensity_a has stopped changing for this long.
+INTENSITY_STABILITY_SECONDS = 5.0
+INTENSITY_WATCH_INTERVAL_SECONDS = 0.25
 
 RSSI_SMOOTHING_ALPHA = 0.25
 POSITION_SMOOTHING_ALPHA = 0.25
@@ -173,6 +165,15 @@ generation_state = {
 
 ble_task: Optional[asyncio.Task] = None
 generation_task: Optional[asyncio.Task] = None
+intensity_watch_task: Optional[asyncio.Task] = None
+
+# Monotonic timestamps are unaffected by system clock adjustments.
+# None means intensity_a has not changed since the server started.
+intensity_change_at: Optional[float] = None
+
+# Timestamp of the most recent intensity change already handled by
+# an automatic or manual generation request.
+last_auto_triggered_change_at: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +197,41 @@ class EmotionParameters(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Emotion parameter tracking
+# ---------------------------------------------------------------------------
+
+def update_emotion_parameters(values: dict) -> bool:
+    """
+    Update one or more emotion parameters.
+
+    If intensity_a actually changes, restart the five-second stability timer.
+
+    Partial dictionaries are allowed, which is useful for GPIO buttons.
+    Returns True if intensity_a changed.
+    """
+    global intensity_change_at
+
+    with state_lock:
+        old_intensity = current_emotion_parameters["intensity_a"]
+
+        current_emotion_parameters.update(values)
+
+        new_intensity = current_emotion_parameters["intensity_a"]
+        intensity_changed = abs(new_intensity - old_intensity) > 1e-9
+
+        if intensity_changed:
+            intensity_change_at = time.monotonic()
+
+            print(
+                f"[AUTO-GENERATION] intensity_a changed "
+                f"{old_intensity:.2f} -> {new_intensity:.2f}. "
+                f"Waiting {INTENSITY_STABILITY_SECONDS:.0f}s for stability."
+            )
+
+        return intensity_changed
+
+
+# ---------------------------------------------------------------------------
 # GPIO emotion controls
 # ---------------------------------------------------------------------------
 
@@ -208,13 +244,9 @@ def handle_gpio_button(button_number: int):
     Button 3: valence_a = 1.0
     Button 4: valence_a = 0.0
 
-    Only the specified parameter changes. All other parameters retain
-    their previous values.
-
-    These changes do not automatically start audio generation.
+    Only the specified parameter changes.
+    Intensity changes start or restart the automatic-generation timer.
     """
-    global current_emotion_parameters
-
     updates = {
         1: {"intensity_a": 1.0},
         2: {"intensity_a": 0.0},
@@ -225,9 +257,9 @@ def handle_gpio_button(button_number: int):
     if button_number not in updates:
         return
 
-    with state_lock:
-        current_emotion_parameters.update(updates[button_number])
+    changed = update_emotion_parameters(updates[button_number])
 
+    with state_lock:
         gpio_status["last_button"] = button_number
         gpio_status["last_update"] = time.time()
         gpio_status["message"] = (
@@ -242,12 +274,18 @@ def handle_gpio_button(button_number: int):
         f"Emotion parameters: {parameters}"
     )
 
+    if button_number in (1, 2) and not changed:
+        print(
+            "[GPIO] Intensity was already at the requested value; "
+            "the stability timer was not restarted."
+        )
+
 
 def initialize_gpio_buttons():
     """
     Initialize all four physical buttons.
 
-    Uses BCM GPIO numbering and the Pi's internal pull-up resistors.
+    Uses BCM GPIO numbering and internal pull-up resistors.
     Each normally open button connects its GPIO pin to GND when pressed.
 
     If GPIO initialization fails, the server continues running without
@@ -263,7 +301,6 @@ def initialize_gpio_buttons():
                 bounce_time=GPIO_BOUNCE_TIME,
             )
 
-            # Capture the current button number in the callback.
             button.when_pressed = (
                 lambda number=button_number:
                 handle_gpio_button(number)
@@ -430,7 +467,10 @@ async def ble_scanner_loop():
                                 + (1.0 - RSSI_SMOOTHING_ALPHA) * old
                             )
 
-                if position_mode == "automatic":
+                with state_lock:
+                    automatic = position_mode == "automatic"
+
+                if automatic:
                     update_position_from_rssi()
 
             except asyncio.CancelledError:
@@ -477,6 +517,84 @@ def set_generation_state(**updates):
         generation_state.update(updates)
 
 
+async def watch_intensity_stability():
+    """
+    Automatically generate a soundscape after intensity_a remains unchanged
+    for INTENSITY_STABILITY_SECONDS.
+
+    If a generation is already running, leave the new intensity change
+    pending. The watcher checks again after the current job finishes.
+    """
+    global generation_task
+    global last_auto_triggered_change_at
+
+    while True:
+        try:
+            await asyncio.sleep(INTENSITY_WATCH_INTERVAL_SECONDS)
+
+            with state_lock:
+                changed_at = intensity_change_at
+
+                if changed_at is None:
+                    continue
+
+                # No new intensity change since the last automatic or manual
+                # generation handled this change.
+                if changed_at == last_auto_triggered_change_at:
+                    continue
+
+                stable_for = time.monotonic() - changed_at
+
+                if stable_for < INTENSITY_STABILITY_SECONDS:
+                    continue
+
+                if generation_state["status"] in ("queued", "running"):
+                    # Keep the latest change pending.
+                    continue
+
+                # Capture the latest emotion parameters when the timer expires.
+                params = dict(current_emotion_parameters)
+                job_id = uuid.uuid4().hex[:12]
+
+                audio_versions[job_id] = {}
+
+                generation_state.update({
+                    "status": "queued",
+                    "job_id": job_id,
+                    "progress": 0,
+                    "total": GRID_SIZE,
+                    "current_column": None,
+                    "message": (
+                        "Intensity remained stable for "
+                        f"{INTENSITY_STABILITY_SECONDS:.0f} seconds. "
+                        "Automatically generating a new soundscape."
+                    ),
+                    "error": None,
+                    "started_at": None,
+                    "finished_at": None,
+                    "parameters": params,
+                })
+
+                # Mark this intensity change as handled when it is queued.
+                last_auto_triggered_change_at = changed_at
+
+            print(
+                f"[AUTO-GENERATION] intensity_a stable for "
+                f"{INTENSITY_STABILITY_SECONDS:.0f}s. "
+                f"Starting job {job_id}; parameters={params}"
+            )
+
+            generation_task = asyncio.create_task(
+                run_generation_job(job_id, params)
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            print(f"[AUTO-GENERATION] Monitor error: {exc}")
+
+
 def generate_one_cell(
     client: StabilityAudioClient,
     job_id: str,
@@ -484,7 +602,7 @@ def generate_one_cell(
     column: int,
 ) -> Path:
     """
-    Generate a cell from the original source.
+    Generate a cell from its original source.
 
     The generated file is published only after generation completes.
     """
@@ -588,6 +706,8 @@ def generate_environment_sync(job_id: str, params: dict):
         )
 
     except Exception as exc:
+        print(f"[GENERATION] Job {job_id} failed: {exc}")
+
         set_generation_state(
             status="failed",
             current_column=None,
@@ -623,6 +743,8 @@ async def health():
             "emotion_parameters": dict(current_emotion_parameters),
             "active_audio_version": active_audio_version,
             "generation": dict(generation_state),
+            "intensity_stability_seconds": INTENSITY_STABILITY_SECONDS,
+            "intensity_change_at": intensity_change_at,
         }
 
 
@@ -695,20 +817,30 @@ async def set_mode(update: ModeUpdate):
 
 @app.post("/api/emotions")
 async def save_emotions(params: EmotionParameters):
-    """Save emotion settings without starting generation."""
-    global current_emotion_parameters
+    """
+    Save emotion settings without directly starting generation.
 
+    A change to intensity_a starts or resets the automatic stability timer.
+    """
     values = params.dict()
+    update_emotion_parameters(values)
 
     with state_lock:
-        current_emotion_parameters = values
+        current = dict(current_emotion_parameters)
 
-    return {"ok": True, "parameters": values}
+    return {
+        "ok": True,
+        "parameters": current,
+        "auto_generation_delay_seconds": INTENSITY_STABILITY_SECONDS,
+    }
 
 
 @app.post("/api/generate")
 async def start_generation(params: EmotionParameters):
-    global generation_task, current_emotion_parameters
+    """Manually request generation using the supplied emotion settings."""
+    global generation_task
+    global intensity_change_at
+    global last_auto_triggered_change_at
 
     values = params.dict()
 
@@ -719,9 +851,18 @@ async def start_generation(params: EmotionParameters):
                 detail="An audio generation job is already queued or running.",
             )
 
-        job_id = uuid.uuid4().hex[:12]
-        current_emotion_parameters = values
+        old_intensity = current_emotion_parameters["intensity_a"]
+        current_emotion_parameters.update(values)
 
+        if abs(values["intensity_a"] - old_intensity) > 1e-9:
+            intensity_change_at = time.monotonic()
+
+        # The manual request handles the current settings. This prevents the
+        # monitor from automatically generating the same change again.
+        if intensity_change_at is not None:
+            last_auto_triggered_change_at = intensity_change_at
+
+        job_id = uuid.uuid4().hex[:12]
         audio_versions[job_id] = {}
 
         generation_state.update({
@@ -730,7 +871,7 @@ async def start_generation(params: EmotionParameters):
             "progress": 0,
             "total": GRID_SIZE,
             "current_column": None,
-            "message": "Generation queued.",
+            "message": "Generation queued manually.",
             "error": None,
             "started_at": None,
             "finished_at": None,
@@ -779,6 +920,7 @@ async def get_live_status():
                 for col, info in published_cells.items()
             },
             "generation": dict(generation_state),
+            "intensity_stability_seconds": INTENSITY_STABILITY_SECONDS,
         }
 
 
@@ -916,8 +1058,9 @@ PAGE = r"""
 <body>
 <h1>Gallery Audio</h1>
 <p class="muted">
-    Move between the two beacons to shape the soundscape. Emotion settings
-    generate new versions of the five cells in the background.
+    Move between the two beacons to shape the soundscape. A change to
+    intensity that remains stable for five seconds automatically generates
+    a new soundscape. Generation runs in the background.
 </p>
 
 <section>
@@ -957,7 +1100,8 @@ PAGE = r"""
     <p class="muted">
         Beacon A is the left end of the space; Beacon B is the right end.
         Intensity changes energy and movement. Valence changes the emotional
-        character from darker to brighter.
+        character from darker to brighter. Changing intensity starts a
+        five-second timer; if it remains stable, generation starts automatically.
     </p>
     <div class="row">
         <div class="control">
@@ -985,7 +1129,7 @@ PAGE = r"""
     </div>
     <div class="row">
         <button id="saveEmotions">Save settings only</button>
-        <button id="generate" class="primary">Generate next soundscape</button>
+        <button id="generate" class="primary">Generate next soundscape now</button>
     </div>
     <p id="generationStatus" class="status muted">
         No generation requested yet.
@@ -1017,6 +1161,7 @@ let generationPollTimer = null;
 let statusPollTimer = null;
 let lastGenerationJob = null;
 let transitionInProgress = false;
+let emotionSaveTimer = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -1340,7 +1485,6 @@ async function pollStatus() {
         }
 
         const data = await response.json();
-        const previousVersions = [...activeVersions];
 
         for (let i = 0; i < GRID_SIZE; i++) {
             const cell = data.cells[String(i)];
@@ -1362,16 +1506,33 @@ async function pollStatus() {
             Math.min(GRID_SIZE - 1, Number(data.column) || 0)
         );
 
-        const changedCurrentCell =
-            activeVersions[column] !== previousVersions[column];
-
         drawGrid();
 
-        if (audioStarted && changedCurrentCell) {
-            await crossfadeToCell(column, true);
-        } else if (audioStarted && column !== currentColumn) {
-            await crossfadeToCell(column);
-        } else if (!audioStarted) {
+        if (audioStarted) {
+            const playingCellVersion = currentCellPlayer
+                ? currentCellPlayer.version
+                : null;
+
+            const playingCellColumn = currentCellPlayer
+                ? currentCellPlayer.column
+                : null;
+
+            const currentVersion = activeVersions[column] || "original";
+
+            if (
+                playingCellColumn === column &&
+                playingCellVersion !== currentVersion
+            ) {
+                await crossfadeToCell(column, true);
+            } else if (column !== currentColumn) {
+                await crossfadeToCell(column);
+            } else if (
+                currentCellPlayer &&
+                currentCellPlayer.version !== currentVersion
+            ) {
+                await crossfadeToCell(column, true);
+            }
+        } else {
             highlightCell(column);
         }
 
@@ -1474,7 +1635,8 @@ async function saveEmotions() {
 
     setStatus(
         "generationStatus",
-        "Emotion settings saved. No audio generation has been started."
+        "Emotion settings saved. If intensity changed, automatic generation "
+        + "will start after it remains stable for five seconds."
     );
 }
 
@@ -1545,6 +1707,7 @@ async function pollGenerationJob(jobId) {
 async function startGeneration() {
     if (generationPollTimer) {
         clearInterval(generationPollTimer);
+        generationPollTimer = null;
     }
 
     $("generate").disabled = true;
@@ -1592,8 +1755,42 @@ async function startGeneration() {
 
 
 // ---------------------------------------------------------------------------
-// UI events
+// Emotion slider debounce and UI events
 // ---------------------------------------------------------------------------
+
+function scheduleEmotionUpdate() {
+    if (emotionSaveTimer !== null) {
+        clearTimeout(emotionSaveTimer);
+    }
+
+    // Debounce slider movement so we do not send a request for every
+    // individual input event while the user is dragging a slider.
+    emotionSaveTimer = setTimeout(async () => {
+        emotionSaveTimer = null;
+
+        try {
+            const response = await fetch("/api/emotions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(getEmotionParams())
+            });
+
+            const result = await response.json();
+
+            if (!response.ok) {
+                throw new Error(
+                    result.detail || "Could not update emotion settings"
+                );
+            }
+
+        } catch (error) {
+            setStatus(
+                "generationStatus",
+                `Could not update emotion settings: ${error.message}`
+            );
+        }
+    }, 250);
+}
 
 $("start").addEventListener("click", () => {
     startAudio().catch(
@@ -1667,7 +1864,10 @@ for (const id of [
     "intensityB",
     "valenceB"
 ]) {
-    $(id).addEventListener("input", refreshEmotionLabels);
+    $(id).addEventListener("input", () => {
+        refreshEmotionLabels();
+        scheduleEmotionUpdate();
+    });
 }
 
 $("saveEmotions").addEventListener("click", () => {
@@ -1702,7 +1902,7 @@ startStatusPolling();
 
 @app.on_event("startup")
 async def startup():
-    global ble_task
+    global ble_task, intensity_watch_task
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
@@ -1715,33 +1915,39 @@ async def startup():
 
     if missing:
         print("Warning: original audio files missing:")
-
         for filename in missing:
             print(f"  - {filename}")
 
     if not (AUDIO_DIR / "drone.mp3").is_file():
         print(f"Warning: missing {AUDIO_DIR / 'drone.mp3'}")
 
-    # Initialize GPIO buttons before accepting requests.
     initialize_gpio_buttons()
 
-    # Start the existing BLE positioning task.
     ble_task = asyncio.create_task(ble_scanner_loop())
+
+    intensity_watch_task = asyncio.create_task(
+        watch_intensity_stability()
+    )
+
+    print(
+        "[AUTO-GENERATION] Monitoring intensity_a; "
+        f"generation delay is {INTENSITY_STABILITY_SECONDS:.0f} seconds."
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global ble_task, generation_task
+    global ble_task, generation_task, intensity_watch_task
 
-    if ble_task:
-        ble_task.cancel()
+    for task in (ble_task, intensity_watch_task):
+        if task:
+            task.cancel()
 
-        try:
-            await ble_task
-        except asyncio.CancelledError:
-            pass
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-    # Release GPIO resources.
     for button in gpio_buttons.values():
         button.close()
 
