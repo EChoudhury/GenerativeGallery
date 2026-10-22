@@ -1,5 +1,20 @@
 # Living Gallery — audio engine starter
 
+## New: Curator’s Gallery platform
+
+The new local website combines artwork upload, DeepSeek image-to-music-prompt interpretation, editable prompts, Stability music generation, loop creation with naming, a saved music library, two-song transitions, automatic intermediate cells and a five-cell listening grid.
+
+Double-click **`打开策展工作台.command`**, or run:
+
+```bash
+.venv/bin/python -m pip install -r curator_platform/requirements.txt
+.venv/bin/python -m curator_platform.app --port 7870
+```
+
+Open <http://127.0.0.1:7870/>. Add `DEEPSEEK_API_KEY` and `STABILITY_API_KEY` to your root `.env` (see `.env.example`). The earlier grid remains separate. See [the curator platform guide](curator_platform/README.md) for the complete workflow, storage, provider requests, and tests.
+
+---
+
 A small first milestone for the ADE hackathon prototype:
 - continuously plays looping WAV layers
 - smoothly crossfades between `storm`, `machine`, and `dream`
