@@ -82,12 +82,14 @@ Requests are user-triggered, one task runs at a time, and paid requests are not 
 
 ## Storage and sharing
 
-All new runtime data lives in `curator_platform/data/`, which is Git-ignored:
+Working audio, uploads and metadata live in `curator_platform/data/`, which is Git-ignored:
 
 - `gallery.sqlite`: artwork metadata, music library, task status and gallery history.
 - `images/`: validated, resized artwork images (JPEG).
 - `music/`: named library recordings.
 - `jobs/<id>/`: prompts, raw results, references, bridge excerpts, grid files and manifests.
+
+Completed grids also export automatically to `audio/<artwork A title> - <artwork B title>/`, containing `cell_0.mp3` through `cell_4.mp3` and `manifest.json`. Folder names use the **two artwork titles**, independently of the optional gallery label. Repeated generations get numbered folders (`-002`, `-003`, …), preserving earlier takes. The library and browser player keep their original WAV files for editing and playback. Existing grids can be exported locally without new provider requests. The grid record’s `mp3_export.directory` identifies its export folder.
 
 Back up the **whole data folder**, including the database, to transfer a collection to another Mac. Stop the service before copying it. Provider keys remain in each collaborator’s own root `.env`. This is a local single-workspace app; it does not provide public hosting, accounts, or multi-user access.
 

@@ -66,6 +66,7 @@ class CuratorPlatformTests(unittest.TestCase):
         cls.real_audio_class = providers.AudioProvider
         cls.temp = tempfile.TemporaryDirectory()
         cls.patches = [patch.object(platform, 'DATA', Path(cls.temp.name)),
+                       patch.object(platform, 'EXPORT_ROOT', Path(cls.temp.name)/'exports'),
                        patch.object(platform, 'EXECUTOR', ImmediateExecutor()),
                        patch.object(providers, 'configured', return_value={'stability': True, 'deepseek': True}),
                        patch.object(providers, 'AudioProvider', FakeAudio)]
@@ -312,6 +313,25 @@ class CuratorPlatformTests(unittest.TestCase):
             self.assertEqual(get.call_count, 2)
             self.assertEqual(post.call_args.kwargs['data']['output_format'], 'wav')
             self.assertIn('remote:remote-id', events)
+
+    def test_mp3_exports_use_artwork_titles_are_complete_and_do_not_overwrite(self):
+        a, b, _, _ = self.saved_pair()
+        first = self.task('grid', a_id=a['id'], b_id=b['id'], context=8, bridge=4, name='A custom gallery label')
+        self.assertEqual(first['status'], 'completed', first.get('error'))
+        grid = self.json('/api/grids/'+first['result']['grid_id'])
+        folder = Path(grid['mp3_export']['directory'])
+        self.assertTrue(folder.name.startswith('Test Painting - Test Painting'))
+        self.assertNotIn('custom gallery', folder.name)
+        for index in range(5):
+            self.assertEqual(sf.info(folder/f'cell_{index}.mp3').format, 'MP3')
+        before = (folder/'cell_2.mp3').read_bytes()
+        self.assertEqual(platform.export_grid_mp3(grid)['directory'], str(folder))
+        second = self.task('grid', a_id=a['id'], b_id=b['id'], context=8, bridge=4)
+        self.assertEqual(second['status'], 'completed', second.get('error'))
+        next_grid = self.json('/api/grids/'+second['result']['grid_id'])
+        self.assertNotEqual(next_grid['mp3_export']['directory'], str(folder))
+        self.assertEqual((folder/'cell_2.mp3').read_bytes(), before)
+        self.assertEqual(json.loads((folder/'manifest.json').read_text())['grid_id'], grid['id'])
 
     def test_named_library_recordings_survive_reopening_the_store(self):
         a, b, _, _ = self.saved_pair()

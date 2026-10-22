@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 from pathlib import Path
 import threading
+import tempfile
 import uuid
 from typing import Literal
 
@@ -28,6 +29,7 @@ from . import audio, providers
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
+EXPORT_ROOT = ROOT.parent / 'audio'
 LOCK = threading.RLock()
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 TERMINAL = {'completed', 'failed'}
@@ -338,6 +340,48 @@ def do_bridge(job, directory, provider):
             'a_id': a['id'], 'b_id': b['id'], 'prompts': prompts}
 
 
+def export_grid_mp3(grid):
+    """Export a complete five-cell set under the two artwork titles, without overwriting other takes."""
+    a, b = find('music', grid['a_id']), find('music', grid['b_id'])
+    title_a = a.get('artwork_title') or a['name']
+    title_b = b.get('artwork_title') or b['name']
+    stem = safe_name(title_a + ' - ' + title_b)
+    with LOCK:
+        EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+        destination = EXPORT_ROOT/stem
+        index = 2
+        while destination.exists():
+            manifest = destination/'manifest.json'
+            try:
+                existing = json.loads(manifest.read_text())
+            except (OSError, ValueError):
+                existing = {}
+            if existing.get('grid_id') == grid['id'] and all((destination/f'cell_{i}.mp3').is_file() for i in range(5)):
+                return {'directory': str(destination.relative_to(ROOT.parent)) if destination.is_relative_to(ROOT.parent) else str(destination),
+                        'artwork_titles': [title_a, title_b], 'files': [f'cell_{i}.mp3' for i in range(5)]}
+            destination = EXPORT_ROOT/f'{stem}-{index:03d}'
+            index += 1
+        with tempfile.TemporaryDirectory(prefix='.grid-export-', dir=EXPORT_ROOT) as temporary:
+            staging = Path(temporary)/'complete'
+            staging.mkdir()
+            for i in range(5):
+                source = asset(grid['files'][str(i)]['file'])
+                samples, rate = sf.read(source, dtype='float32', always_2d=True)
+                target = staging/f'cell_{i}.mp3'
+                sf.write(target, samples, rate, format='MP3', subtype='MPEG_LAYER_III')
+                info = sf.info(target)
+                if info.format != 'MP3' or abs(info.duration-len(samples)/rate) > 0.15:
+                    raise ValueError('An MP3 export did not pass validation; original WAV files were retained.')
+            report = {'grid_id': grid['id'], 'gallery_name': grid['name'], 'artwork_titles': [title_a, title_b],
+                      'method': grid.get('method', 'hybrid'), 'created_at': grid['created_at'],
+                      'cells': [{'file': f'cell_{i}.mp3', 'label': grid['files'][str(i)]['label'],
+                                 'duration': grid['files'][str(i)]['duration']} for i in range(5)]}
+            (staging/'manifest.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+            staging.rename(destination)
+        return {'directory': str(destination.relative_to(ROOT.parent)) if destination.is_relative_to(ROOT.parent) else str(destination),
+                'artwork_titles': [title_a, title_b], 'files': [f'cell_{i}.mp3' for i in range(5)]}
+
+
 def do_grid(job, directory, provider):
     payload = job['payload']
     if payload.get('source_job_id'):
@@ -406,6 +450,7 @@ def do_grid(job, directory, provider):
             'files': files, 'middle_interval': [start, end], 'loop_overlap': .25,
             'method': payload.get('method', 'hybrid'),
             'created_at': now(), 'bridge_job_id': payload.get('source_job_id') or job['id']}
+    grid['mp3_export'] = export_grid_mp3(grid)
     (directory/'manifest.json').write_text(json.dumps(grid, indent=2))
     put('grid', grid)
     return {'grid_id': grid['id'], 'bridge': result}
