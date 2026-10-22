@@ -83,9 +83,9 @@ BASE_SOUND_PROMPT = (
 # BCM GPIO numbering.
 # GPIO 27 is physical pin 13, NOT physical pin 27.
 GPIO_BUTTON_PINS = {
-    1: 17,  # Physical pin 11: intensity_a = 1.0
-    2: 27,  # Physical pin 13: intensity_a = 0.0
-    3: 22,  # Physical pin 15: valence_a = 1.0
+    1: 27,  # Physical pin 11: intensity_a = 1.0
+    2: 22,  # Physical pin 13: intensity_a = 0.0
+    3: 17,  # Physical pin 15: valence_a = 1.0
     4: 23,  # Physical pin 16: valence_a = 0.0
 }
 
