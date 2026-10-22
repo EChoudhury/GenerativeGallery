@@ -1,13 +1,22 @@
 """
-Gallery Grid Audio Server: two-beacon BLE positioning + crossfading.
+server.py
+
+Gallery Grid Audio Server:
+- Two-beacon BLE positioning along a 1D gallery.
+- Five audio cells with browser-side Web Audio crossfading.
+- Independent continuous drone.
+- Background Stability AI generation from two emotional endpoints.
+- Publishes each generated cell as soon as it is ready.
+- Live browser crossfade when the currently playing cell is updated.
+- Four Raspberry Pi GPIO buttons for live emotion parameter control.
 
 Install:
-    pip install fastapi uvicorn bleak
+    pip install fastapi uvicorn bleak requests python-dotenv gpiozero
 
 Run:
     uvicorn server:app --host 0.0.0.0 --port 8000
 
-Audio files:
+Expected original audio files:
     audio/cell_0.mp3
     audio/cell_1.mp3
     audio/cell_2.mp3
@@ -15,967 +24,1732 @@ Audio files:
     audio/cell_4.mp3
     audio/drone.mp3
 
-BLE beacon names:
-    BEACON-1
-    BEACON-2
+GPIO buttons (BCM numbering):
+    Button 1: GPIO 17 (physical pin 11) -> intensity_a = 1.0
+    Button 2: GPIO 27 (physical pin 13) -> intensity_a = 0.0
+    Button 3: GPIO 22 (physical pin 15) -> valence_a = 1.0
+    Button 4: GPIO 23 (physical pin 16) -> valence_a = 0.0
 
-The Raspberry Pi must be carried by the listener.
-The two beacons should be placed at opposite ends of the gallery.
+Connect each normally open button between its GPIO pin and GND.
 
-Position is estimated from the difference between the two RSSI readings.
-This is a relative estimate, not accurate physical ranging.
+Environment:
+    STABILITY_API_KEY=your_api_key
+    BEACON_A_ADDRESS=AA:BB:CC:DD:EE:01
+    BEACON_B_ADDRESS=AA:BB:CC:DD:EE:02
 """
 
 import asyncio
+import math
+import os
+import threading
 import time
+import uuid
 from pathlib import Path
-from threading import Lock
+from typing import Optional
 
 from bleak import BleakScanner
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
+from gpiozero import Button
 
+from generate_assets import StabilityAudioClient, build_emotion_prompt
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-
-GRID_SIZE = 5
-GRID_MAX = 5.0
-AUDIO_DIR = Path("audio")
-
-BEACON_NAMES = {
-    1: "BEACON-1",
-    2: "BEACON-2",
-}
-
-# Approximate RSSI difference, in dB, between the two beacons
-# when the Pi is near either end of the gallery.
-#
-# CALIBRATE THIS VALUE IN YOUR ROOM.
-# Increase it if the position changes too much.
-# Decrease it if the position barely changes.
-RSSI_DIFF_AT_END = 12.0
-
-# Smooth noisy RSSI measurements.
-RSSI_EMA_ALPHA = 0.25
-
-# Smooth the calculated position as well.
-POSITION_EMA_ALPHA = 0.20
-
-RSSI_STALE_SECONDS = 5.0
-POSITION_UPDATE_INTERVAL = 0.15
-
-# Prevent tiny changes from constantly switching columns.
-COLUMN_HYSTERESIS = 0.12
+load_dotenv()
 
 app = FastAPI(title="Gallery Grid Audio Server")
-state_lock = Lock()
 
-current_position = {"x": 2.5, "y": 0.0}
-position_source = "default"
-position_mode = "ble"
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+GRID_SIZE = 5
+GRID_MAX_X = 5.0
+
+AUDIO_DIR = Path("audio")
+GENERATED_DIR = AUDIO_DIR / "generated"
+
+BEACON_A_ADDRESS = os.getenv("BEACON_A_ADDRESS", "").strip().lower()
+BEACON_B_ADDRESS = os.getenv("BEACON_B_ADDRESS", "").strip().lower()
+
+GENERATION_DURATION_SECONDS = 30
+GENERATION_STRENGTH = 0.80
+
+RSSI_SMOOTHING_ALPHA = 0.25
+POSITION_SMOOTHING_ALPHA = 0.25
+BLE_SCAN_INTERVAL_SECONDS = 0.5
+
+BASE_SOUND_PROMPT = (
+    "A calming, immersive ambient soundscape for a contemporary art gallery. "
+    "A continuous tonal foundation with evolving organic textures, subtle "
+    "rhythmic detail, spatial depth, and a coherent musical identity. "
+    "No vocals. No abrupt cuts."
+)
+
+# BCM GPIO numbering.
+# GPIO 27 is physical pin 13, NOT physical pin 27.
+GPIO_BUTTON_PINS = {
+    1: 17,  # Physical pin 11: intensity_a = 1.0
+    2: 27,  # Physical pin 13: intensity_a = 0.0
+    3: 22,  # Physical pin 15: valence_a = 1.0
+    4: 23,  # Physical pin 16: valence_a = 0.0
+}
+
+GPIO_BOUNCE_TIME = 0.15
+
+
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
+
+state_lock = threading.RLock()
+
+current_position = {"x": 0.0, "y": 0.0}
+position_source = "ble"
+position_mode = "automatic"
 
 beacon_rssi = {
-    beacon_id: {
-        "rssi": None,
-        "last_seen": None,
-        "samples": 0,
-    }
-    for beacon_id in BEACON_NAMES
+    "a": None,
+    "b": None,
 }
 
 ble_status = {
     "running": False,
-    "last_error": None,
+    "message": "BLE scanner has not started.",
     "last_update": None,
-    "rssi_difference": None,
 }
 
-ble_task = None
-last_estimated_x = None
-current_column = 2
+gpio_status = {
+    "available": False,
+    "message": "GPIO buttons have not been initialized.",
+    "last_button": None,
+    "last_update": None,
+}
+
+gpio_buttons = {}
+
+smoothed_position_x = 0.0
+current_column = 0
+
+current_emotion_parameters = {
+    "intensity_a": 0.5,
+    "valence_a": 0.0,
+    "intensity_b": 0.5,
+    "valence_b": 0.0,
+}
+
+audio_versions = {
+    "original": {
+        col: AUDIO_DIR / f"cell_{col}.mp3"
+        for col in range(GRID_SIZE)
+    }
+}
+
+active_audio_version = "original"
+
+published_cells = {
+    col: {
+        "version": "original",
+        "url": f"/audio/{col}?version=original",
+        "updated_at": None,
+    }
+    for col in range(GRID_SIZE)
+}
+
+generation_state = {
+    "status": "idle",
+    "job_id": None,
+    "progress": 0,
+    "total": GRID_SIZE,
+    "current_column": None,
+    "message": "No generation requested yet.",
+    "error": None,
+    "started_at": None,
+    "finished_at": None,
+    "parameters": None,
+}
+
+ble_task: Optional[asyncio.Task] = None
+generation_task: Optional[asyncio.Task] = None
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Models
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-class Position(BaseModel):
-    x: float = Field(ge=0.0, le=5.0)
-    y: float = Field(ge=0.0, le=5.0)
+class PositionUpdate(BaseModel):
+    x: float = Field(ge=0.0, le=GRID_MAX_X)
+    y: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
-class Mode(BaseModel):
+class ModeUpdate(BaseModel):
     mode: str
 
 
-# ------------------------------------------------------------
-# Audio files
-# ------------------------------------------------------------
-
-def get_audio_path(col: int) -> Path:
-    return AUDIO_DIR / f"cell_{col}.mp3"
-
-
-def get_drone_path() -> Path:
-    return AUDIO_DIR / "drone.mp3"
+class EmotionParameters(BaseModel):
+    intensity_a: float = Field(ge=0.0, le=1.0)
+    valence_a: float = Field(ge=-1.0, le=1.0)
+    intensity_b: float = Field(ge=0.0, le=1.0)
+    valence_b: float = Field(ge=-1.0, le=1.0)
 
 
-def column_from_x(x: float) -> int:
-    """Map X in [0, 5] to one of five columns."""
-    return min(GRID_SIZE - 1, max(0, int(x)))
+# ---------------------------------------------------------------------------
+# GPIO emotion controls
+# ---------------------------------------------------------------------------
 
-
-def get_available_columns() -> list[int]:
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    return [
-        col for col in range(GRID_SIZE)
-        if get_audio_path(col).is_file()
-    ]
-
-
-# ------------------------------------------------------------
-# RSSI handling
-# ------------------------------------------------------------
-
-def update_beacon_rssi(beacon_id: int, rssi: int) -> None:
-    now = time.monotonic()
-
-    with state_lock:
-        record = beacon_rssi.get(beacon_id)
-        if record is None:
-            return
-
-        previous = record["rssi"]
-        last_seen = record["last_seen"]
-
-        if (
-            previous is None
-            or last_seen is None
-            or now - last_seen > RSSI_STALE_SECONDS
-        ):
-            smoothed = float(rssi)
-        else:
-            smoothed = (
-                RSSI_EMA_ALPHA * float(rssi)
-                + (1.0 - RSSI_EMA_ALPHA) * previous
-            )
-
-        record["rssi"] = smoothed
-        record["last_seen"] = now
-        record["samples"] += 1
-
-
-def get_fresh_rssi() -> dict[int, float]:
-    now = time.monotonic()
-    result = {}
-
-    with state_lock:
-        for beacon_id, record in beacon_rssi.items():
-            rssi = record["rssi"]
-            last_seen = record["last_seen"]
-
-            if (
-                rssi is not None
-                and last_seen is not None
-                and now - last_seen <= RSSI_STALE_SECONDS
-            ):
-                result[beacon_id] = rssi
-
-    return result
-
-
-# ------------------------------------------------------------
-# One-dimensional position estimation
-# ------------------------------------------------------------
-
-def estimate_x(readings: dict[int, float]) -> float | None:
+def handle_gpio_button(button_number: int):
     """
-    Estimate position along a line between two beacons.
+    Update emotion parameters when a physical GPIO button is pressed.
 
-    Beacon 1 is at X=0.
-    Beacon 2 is at X=5.
+    Button 1: intensity_a = 1.0
+    Button 2: intensity_a = 0.0
+    Button 3: valence_a = 1.0
+    Button 4: valence_a = 0.0
 
-    If Beacon 1 is stronger, X moves toward zero.
-    If Beacon 2 is stronger, X moves toward five.
+    Only the specified parameter changes. All other parameters retain
+    their previous values.
+
+    These changes do not automatically start audio generation.
     """
+    global current_emotion_parameters
 
-    if 1 not in readings or 2 not in readings:
-        return None
+    updates = {
+        1: {"intensity_a": 1.0},
+        2: {"intensity_a": 0.0},
+        3: {"valence_a": 1.0},
+        4: {"valence_a": 0.0},
+    }
 
-    rssi_1 = readings[1]
-    rssi_2 = readings[2]
-
-    # Positive difference means Beacon 1 is stronger.
-    difference = rssi_1 - rssi_2
-
-    # Convert relative RSSI difference to X in [0, 5].
-    # Equal signal strength gives the midpoint, X=2.5.
-    x = 2.5 - (
-        difference * GRID_MAX
-        / (2.0 * RSSI_DIFF_AT_END)
-    )
-
-    return max(0.0, min(GRID_MAX, x))
-
-
-def update_position_from_ble() -> None:
-    global last_estimated_x, current_column, position_source
-
-    with state_lock:
-        if position_mode != "ble":
-            return
-
-    readings = get_fresh_rssi()
-    x = estimate_x(readings)
-
-    # Both beacons must be detected recently.
-    if x is None:
+    if button_number not in updates:
         return
 
     with state_lock:
-        if position_mode != "ble":
+        current_emotion_parameters.update(updates[button_number])
+
+        gpio_status["last_button"] = button_number
+        gpio_status["last_update"] = time.time()
+        gpio_status["message"] = (
+            f"Button {button_number} pressed. "
+            f"Updated: {updates[button_number]}"
+        )
+
+        parameters = dict(current_emotion_parameters)
+
+    print(
+        f"[GPIO] Button {button_number} pressed | "
+        f"Emotion parameters: {parameters}"
+    )
+
+
+def initialize_gpio_buttons():
+    """
+    Initialize all four physical buttons.
+
+    Uses BCM GPIO numbering and the Pi's internal pull-up resistors.
+    Each normally open button connects its GPIO pin to GND when pressed.
+
+    If GPIO initialization fails, the server continues running without
+    physical button controls.
+    """
+    global gpio_buttons
+
+    try:
+        for button_number, pin in GPIO_BUTTON_PINS.items():
+            button = Button(
+                pin,
+                pull_up=True,
+                bounce_time=GPIO_BOUNCE_TIME,
+            )
+
+            # Capture the current button number in the callback.
+            button.when_pressed = (
+                lambda number=button_number:
+                handle_gpio_button(number)
+            )
+
+            gpio_buttons[button_number] = button
+
+            print(
+                f"[GPIO] Button {button_number} initialized: "
+                f"BCM GPIO {pin}"
+            )
+
+        with state_lock:
+            gpio_status["available"] = True
+            gpio_status["message"] = (
+                "All four GPIO buttons initialized successfully."
+            )
+
+        print("[GPIO] All four emotion buttons initialized.")
+
+    except Exception as exc:
+        for button in gpio_buttons.values():
+            button.close()
+
+        gpio_buttons.clear()
+
+        with state_lock:
+            gpio_status["available"] = False
+            gpio_status["message"] = (
+                f"GPIO initialization failed: {exc}"
+            )
+
+        print(f"[GPIO] Initialization failed: {exc}")
+        print("[GPIO] Server will continue without physical buttons.")
+
+
+# ---------------------------------------------------------------------------
+# Positioning
+# ---------------------------------------------------------------------------
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def x_to_column(x: float) -> int:
+    """Map x in [0, 5] to one of five cells."""
+    return min(GRID_SIZE - 1, max(0, int(round(x))))
+
+
+def estimate_x_from_rssi(
+    rssi_a: Optional[float],
+    rssi_b: Optional[float],
+) -> Optional[float]:
+    """
+    Estimate position between two beacons.
+
+    A stronger beacon A signal places the visitor closer to x=0.
+    A stronger beacon B signal places the visitor closer to x=5.
+    """
+    if rssi_a is None and rssi_b is None:
+        return None
+
+    if rssi_a is None:
+        return GRID_MAX_X
+
+    if rssi_b is None:
+        return 0.0
+
+    difference = rssi_a - rssi_b
+
+    fraction_toward_b = 1.0 / (
+        1.0 + math.exp(clamp(difference / 8.0, -20, 20))
+    )
+
+    return fraction_toward_b * GRID_MAX_X
+
+
+def update_position_from_rssi():
+    global smoothed_position_x, current_column
+
+    with state_lock:
+        raw_x = estimate_x_from_rssi(
+            beacon_rssi["a"],
+            beacon_rssi["b"],
+        )
+
+        if raw_x is None:
             return
 
-        if last_estimated_x is None:
-            smoothed_x = x
-        else:
-            smoothed_x = (
-                POSITION_EMA_ALPHA * x
-                + (1.0 - POSITION_EMA_ALPHA) * last_estimated_x
-            )
+        smoothed_position_x = (
+            POSITION_SMOOTHING_ALPHA * raw_x
+            + (1.0 - POSITION_SMOOTHING_ALPHA) * smoothed_position_x
+        )
 
-        last_estimated_x = smoothed_x
-
-        # Apply a small hysteresis around column boundaries.
-        # This reduces rapid switching due to RSSI fluctuations.
-        proposed_column = column_from_x(smoothed_x)
-
-        if proposed_column != current_column:
-            boundary = (
-                min(proposed_column, current_column) + 1
-            )
-
-            if proposed_column > current_column:
-                should_switch = smoothed_x >= (
-                    boundary + COLUMN_HYSTERESIS
-                )
-            else:
-                should_switch = smoothed_x <= (
-                    boundary - COLUMN_HYSTERESIS
-                )
-
-            if should_switch:
-                current_column = proposed_column
-
-        current_position["x"] = smoothed_x
+        current_position["x"] = clamp(
+            smoothed_position_x,
+            0.0,
+            GRID_MAX_X,
+        )
         current_position["y"] = 0.0
-        position_source = "ble"
 
+        current_column = x_to_column(current_position["x"])
         ble_status["last_update"] = time.time()
-        ble_status["rssi_difference"] = round(
-            readings[1] - readings[2], 1
+
+
+def normalize_address(address: str) -> str:
+    return address.strip().lower()
+
+
+async def ble_scanner_loop():
+    """Continuously scan for the two configured BLE beacons."""
+    global beacon_rssi
+
+    if not BEACON_A_ADDRESS or not BEACON_B_ADDRESS:
+        with state_lock:
+            ble_status["running"] = False
+            ble_status["message"] = (
+                "Set BEACON_A_ADDRESS and BEACON_B_ADDRESS to enable BLE."
+            )
+        return
+
+    with state_lock:
+        ble_status["running"] = True
+        ble_status["message"] = "Scanning for configured beacons."
+
+    try:
+        while True:
+            try:
+                discovered = await BleakScanner.discover(
+                    timeout=1.0,
+                    return_adv=True,
+                )
+
+                for address, result in discovered.items():
+                    device, advertisement = result
+                    normalized = normalize_address(address)
+
+                    rssi = getattr(advertisement, "rssi", None)
+
+                    if rssi is None:
+                        rssi = getattr(device, "rssi", None)
+
+                    if rssi is None:
+                        continue
+
+                    with state_lock:
+                        if normalized == BEACON_A_ADDRESS:
+                            old = beacon_rssi["a"]
+
+                            beacon_rssi["a"] = (
+                                float(rssi)
+                                if old is None
+                                else RSSI_SMOOTHING_ALPHA * float(rssi)
+                                + (1.0 - RSSI_SMOOTHING_ALPHA) * old
+                            )
+
+                        elif normalized == BEACON_B_ADDRESS:
+                            old = beacon_rssi["b"]
+
+                            beacon_rssi["b"] = (
+                                float(rssi)
+                                if old is None
+                                else RSSI_SMOOTHING_ALPHA * float(rssi)
+                                + (1.0 - RSSI_SMOOTHING_ALPHA) * old
+                            )
+
+                if position_mode == "automatic":
+                    update_position_from_rssi()
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                with state_lock:
+                    ble_status["message"] = f"BLE scan error: {exc}"
+
+            await asyncio.sleep(BLE_SCAN_INTERVAL_SECONDS)
+
+    except asyncio.CancelledError:
+        pass
+
+    finally:
+        with state_lock:
+            ble_status["running"] = False
+            ble_status["message"] = "BLE scanner stopped."
+
+
+# ---------------------------------------------------------------------------
+# Emotion-to-prompt mapping and generation
+# ---------------------------------------------------------------------------
+
+def interpolate_emotions(params: dict, column: int):
+    """Interpolate intensity and valence from beacon A to beacon B."""
+    t = column / max(1, GRID_SIZE - 1)
+
+    intensity = (
+        params["intensity_a"] * (1.0 - t)
+        + params["intensity_b"] * t
+    )
+
+    valence = (
+        params["valence_a"] * (1.0 - t)
+        + params["valence_b"] * t
+    )
+
+    return intensity, valence
+
+
+def set_generation_state(**updates):
+    with state_lock:
+        generation_state.update(updates)
+
+
+def generate_one_cell(
+    client: StabilityAudioClient,
+    job_id: str,
+    params: dict,
+    column: int,
+) -> Path:
+    """
+    Generate a cell from the original source.
+
+    The generated file is published only after generation completes.
+    """
+    source = AUDIO_DIR / f"cell_{column}.mp3"
+    version_dir = GENERATED_DIR / job_id
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    output = version_dir / f"cell_{column}.mp3"
+
+    intensity, valence = interpolate_emotions(params, column)
+
+    prompt = build_emotion_prompt(
+        base_prompt=BASE_SOUND_PROMPT,
+        intensity=intensity,
+        valence=valence,
+    )
+
+    client.transition(
+        source_path=source,
+        prompt=prompt,
+        output_path=output,
+        duration=GENERATION_DURATION_SECONDS,
+        strength=GENERATION_STRENGTH,
+    )
+
+    if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(
+            f"Generated audio for cell {column} is missing or empty."
         )
 
-        print(
-            f"RSSI 1={readings[1]:.1f} dBm, "
-            f"RSSI 2={readings[2]:.1f} dBm, "
-            f"X={smoothed_x:.2f}, "
-            f"column={current_column}"
-        )
+    return output
 
 
-# ------------------------------------------------------------
-# BLE scanner
-# ------------------------------------------------------------
+def publish_cell(job_id: str, column: int, audio_path: Path):
+    """Publish a completed audio cell to browser clients."""
+    global active_audio_version
 
-async def ble_scanner_loop() -> None:
-    def detection_callback(device, advertisement_data):
-        name = (
-            advertisement_data.local_name
-            or device.name
-            or ""
-        )
+    with state_lock:
+        if job_id not in audio_versions:
+            audio_versions[job_id] = {}
 
-        for beacon_id, expected_name in BEACON_NAMES.items():
-            if name != expected_name:
-                continue
+        audio_versions[job_id][column] = audio_path
+        active_audio_version = job_id
 
-            rssi = getattr(advertisement_data, "rssi", None)
+        published_cells[column] = {
+            "version": job_id,
+            "url": f"/audio/{column}?version={job_id}",
+            "updated_at": time.time(),
+        }
 
-            if rssi is None:
-                rssi = getattr(device, "rssi", None)
 
-            if rssi is not None:
-                update_beacon_rssi(beacon_id, rssi)
-
-            break
-
-    scanner = BleakScanner(
-        detection_callback=detection_callback
+def generate_environment_sync(job_id: str, params: dict):
+    """Generate and publish each of the five cells sequentially."""
+    set_generation_state(
+        status="running",
+        job_id=job_id,
+        progress=0,
+        total=GRID_SIZE,
+        current_column=0,
+        message="Generating cell 1 of 5...",
+        error=None,
+        started_at=time.time(),
+        finished_at=None,
+        parameters=params,
     )
 
     try:
-        await scanner.start()
+        client = StabilityAudioClient()
 
-        with state_lock:
-            ble_status["running"] = True
-            ble_status["last_error"] = None
+        for column in range(GRID_SIZE):
+            set_generation_state(
+                current_column=column,
+                message=f"Generating cell {column + 1} of {GRID_SIZE}...",
+            )
 
-        print("BLE scanner started.")
-        print("Waiting for BEACON-1 and BEACON-2...")
+            audio_path = generate_one_cell(
+                client=client,
+                job_id=job_id,
+                params=params,
+                column=column,
+            )
 
-        while True:
-            update_position_from_ble()
-            await asyncio.sleep(POSITION_UPDATE_INTERVAL)
+            publish_cell(job_id, column, audio_path)
 
-    except asyncio.CancelledError:
-        raise
+            set_generation_state(
+                progress=column + 1,
+                current_column=column,
+                message=(
+                    f"Published cell {column + 1} of {GRID_SIZE}. "
+                    "Playback can use this version now."
+                ),
+            )
+
+        set_generation_state(
+            status="completed",
+            progress=GRID_SIZE,
+            current_column=None,
+            message="All five cells have been generated and published.",
+            error=None,
+            finished_at=time.time(),
+        )
 
     except Exception as exc:
-        with state_lock:
-            ble_status["last_error"] = str(exc)
-            ble_status["running"] = False
-
-        print(f"BLE scanner error: {exc}")
-
-    finally:
-        try:
-            await scanner.stop()
-        except Exception:
-            pass
-
-        with state_lock:
-            ble_status["running"] = False
+        set_generation_state(
+            status="failed",
+            current_column=None,
+            message="Generation stopped. Completed cells remain available.",
+            error=str(exc),
+            finished_at=time.time(),
+        )
 
 
-# ------------------------------------------------------------
+async def run_generation_job(job_id: str, params: dict):
+    await asyncio.to_thread(generate_environment_sync, job_id, params)
+
+
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(PAGE)
+
+
+@app.get("/health")
+async def health():
+    with state_lock:
+        return {
+            "ok": True,
+            "position_mode": position_mode,
+            "position": dict(current_position),
+            "beacons": dict(beacon_rssi),
+            "ble": dict(ble_status),
+            "gpio": dict(gpio_status),
+            "emotion_parameters": dict(current_emotion_parameters),
+            "active_audio_version": active_audio_version,
+            "generation": dict(generation_state),
+        }
+
+
+@app.get("/api/gpio")
+async def get_gpio_status():
+    """Return GPIO status, pin assignments, and current emotion settings."""
+    with state_lock:
+        return {
+            "gpio": dict(gpio_status),
+            "pins": dict(GPIO_BUTTON_PINS),
+            "parameters": dict(current_emotion_parameters),
+        }
+
+
+@app.get("/position")
+async def get_position():
+    with state_lock:
+        return {
+            "x": current_position["x"],
+            "y": current_position["y"],
+            "column": current_column,
+            "source": position_source,
+            "mode": position_mode,
+            "beacons": dict(beacon_rssi),
+            "active_audio_version": active_audio_version,
+            "cells": {
+                str(col): dict(info)
+                for col, info in published_cells.items()
+            },
+        }
+
+
+@app.post("/position")
+async def set_position(position: PositionUpdate):
+    global current_column, smoothed_position_x, position_source
+
+    with state_lock:
+        current_position["x"] = position.x
+        current_position["y"] = position.y
+        smoothed_position_x = position.x
+        current_column = x_to_column(position.x)
+        position_source = "manual"
+
+    return {
+        "ok": True,
+        "x": position.x,
+        "y": position.y,
+        "column": current_column,
+    }
+
+
+@app.post("/mode")
+async def set_mode(update: ModeUpdate):
+    global position_mode, position_source
+
+    mode = update.mode.strip().lower()
+
+    if mode not in ("automatic", "manual"):
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be 'automatic' or 'manual'",
+        )
+
+    with state_lock:
+        position_mode = mode
+        position_source = "ble" if mode == "automatic" else "manual"
+
+    return {"ok": True, "mode": mode}
+
+
+@app.post("/api/emotions")
+async def save_emotions(params: EmotionParameters):
+    """Save emotion settings without starting generation."""
+    global current_emotion_parameters
+
+    values = params.dict()
+
+    with state_lock:
+        current_emotion_parameters = values
+
+    return {"ok": True, "parameters": values}
+
+
+@app.post("/api/generate")
+async def start_generation(params: EmotionParameters):
+    global generation_task, current_emotion_parameters
+
+    values = params.dict()
+
+    with state_lock:
+        if generation_state["status"] in ("queued", "running"):
+            raise HTTPException(
+                status_code=409,
+                detail="An audio generation job is already queued or running.",
+            )
+
+        job_id = uuid.uuid4().hex[:12]
+        current_emotion_parameters = values
+
+        audio_versions[job_id] = {}
+
+        generation_state.update({
+            "status": "queued",
+            "job_id": job_id,
+            "progress": 0,
+            "total": GRID_SIZE,
+            "current_column": None,
+            "message": "Generation queued.",
+            "error": None,
+            "started_at": None,
+            "finished_at": None,
+            "parameters": values,
+        })
+
+    generation_task = asyncio.create_task(
+        run_generation_job(job_id, values)
+    )
+
+    return {
+        "ok": True,
+        "status": "queued",
+        "job_id": job_id,
+        "parameters": values,
+    }
+
+
+@app.get("/api/generation/{job_id}")
+async def get_generation(job_id: str):
+    with state_lock:
+        if generation_state["job_id"] != job_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Generation job not found.",
+            )
+
+        return dict(generation_state)
+
+
+@app.get("/api/status")
+async def get_live_status():
+    """Return live positioning, GPIO, emotion, audio, and generation state."""
+    with state_lock:
+        return {
+            "position": dict(current_position),
+            "column": current_column,
+            "mode": position_mode,
+            "beacons": dict(beacon_rssi),
+            "ble": dict(ble_status),
+            "gpio": dict(gpio_status),
+            "emotion_parameters": dict(current_emotion_parameters),
+            "active_audio_version": active_audio_version,
+            "cells": {
+                str(col): dict(info)
+                for col, info in published_cells.items()
+            },
+            "generation": dict(generation_state),
+        }
+
+
+def audio_file_for_column(
+    column: int,
+    version: Optional[str],
+) -> Path:
+    if column < 0 or column >= GRID_SIZE:
+        raise HTTPException(status_code=404, detail="Unknown audio column.")
+
+    with state_lock:
+        chosen_version = version or published_cells[column]["version"]
+        version_map = audio_versions.get(chosen_version)
+
+        if version_map is None or column not in version_map:
+            chosen_version = published_cells[column]["version"]
+            version_map = audio_versions.get(chosen_version)
+
+        if version_map is None or column not in version_map:
+            raise HTTPException(
+                status_code=404,
+                detail="No audio is available for this column.",
+            )
+
+        path = version_map[column]
+
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found.")
+
+    return path
+
+
+@app.get("/audio/{column}")
+async def stream_cell_audio(
+    column: int,
+    version: Optional[str] = None,
+):
+    path = audio_file_for_column(column, version)
+
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/audio/drone")
+async def stream_drone():
+    path = AUDIO_DIR / "drone.mp3"
+
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Drone audio not found: {path}",
+        )
+
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Browser UI
+# ---------------------------------------------------------------------------
+
+PAGE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gallery Audio</title>
+<style>
+    :root { color-scheme: dark; }
+    body {
+        font-family: system-ui, sans-serif;
+        max-width: 1000px;
+        margin: 0 auto;
+        padding: 22px;
+        background: #151515;
+        color: #f1f1f1;
+    }
+    h1, h2 { font-weight: 550; }
+    section {
+        margin: 18px 0;
+        padding: 18px;
+        border: 1px solid #383838;
+        border-radius: 12px;
+        background: #1d1d1d;
+    }
+    .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+    }
+    button {
+        border: 0;
+        border-radius: 7px;
+        padding: 10px 14px;
+        color: #fff;
+        background: #454545;
+        cursor: pointer;
+    }
+    button.primary { background: #476b99; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 6px;
+        margin-top: 12px;
+    }
+    .cell {
+        padding: 14px 4px;
+        text-align: center;
+        border: 1px solid #444;
+        border-radius: 7px;
+        background: #292929;
+    }
+    .cell.active { background: #476b99; }
+    .cell.updated { border-color: #75bd91; }
+    label { display: block; margin: 10px 0 5px; }
+    input[type="range"] { width: 100%; }
+    .control { flex: 1 1 220px; }
+    .muted { color: #aaa; font-size: .92rem; }
+    .status { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .value { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>Gallery Audio</h1>
+<p class="muted">
+    Move between the two beacons to shape the soundscape. Emotion settings
+    generate new versions of the five cells in the background.
+</p>
+
+<section>
+    <h2>Playback</h2>
+    <div class="row">
+        <button id="start" class="primary">Start audio</button>
+        <button id="stop">Stop audio</button>
+        <button id="auto">Automatic positioning</button>
+        <button id="manual">Manual positioning</button>
+    </div>
+    <div class="control">
+        <label for="manualX">Manual position: <span id="manualValue">0.0</span></label>
+        <input id="manualX" type="range" min="0" max="5" step="0.05" value="0">
+    </div>
+    <div class="control">
+        <label for="crossfade">Crossfade duration:
+            <span id="crossfadeValue">4.0 s</span>
+        </label>
+        <input id="crossfade" type="range" min="0.5" max="12" step="0.5" value="4">
+    </div>
+    <div class="row">
+        <div class="control">
+            <label for="cellVolume">Cell volume</label>
+            <input id="cellVolume" type="range" min="0" max="1" step="0.01" value="0.8">
+        </div>
+        <div class="control">
+            <label for="droneVolume">Drone volume</label>
+            <input id="droneVolume" type="range" min="0" max="1" step="0.01" value="0.25">
+        </div>
+    </div>
+    <p id="playbackStatus" class="status muted">Audio stopped.</p>
+    <div id="grid" class="grid"></div>
+</section>
+
+<section>
+    <h2>Emotion settings</h2>
+    <p class="muted">
+        Beacon A is the left end of the space; Beacon B is the right end.
+        Intensity changes energy and movement. Valence changes the emotional
+        character from darker to brighter.
+    </p>
+    <div class="row">
+        <div class="control">
+            <h3>Beacon A · left</h3>
+            <label for="intensityA">Intensity:
+                <span id="intensityAValue" class="value">0.50</span>
+            </label>
+            <input id="intensityA" type="range" min="0" max="1" step="0.05" value="0.5">
+            <label for="valenceA">Valence:
+                <span id="valenceAValue" class="value">0.00</span>
+            </label>
+            <input id="valenceA" type="range" min="-1" max="1" step="0.05" value="0">
+        </div>
+        <div class="control">
+            <h3>Beacon B · right</h3>
+            <label for="intensityB">Intensity:
+                <span id="intensityBValue" class="value">0.50</span>
+            </label>
+            <input id="intensityB" type="range" min="0" max="1" step="0.05" value="0.5">
+            <label for="valenceB">Valence:
+                <span id="valenceBValue" class="value">0.00</span>
+            </label>
+            <input id="valenceB" type="range" min="-1" max="1" step="0.05" value="0">
+        </div>
+    </div>
+    <div class="row">
+        <button id="saveEmotions">Save settings only</button>
+        <button id="generate" class="primary">Generate next soundscape</button>
+    </div>
+    <p id="generationStatus" class="status muted">
+        No generation requested yet.
+    </p>
+</section>
+
+<section>
+    <h2>Position and system status</h2>
+    <p id="systemStatus" class="status muted">Connecting to server...</p>
+</section>
+
+<script>
+const GRID_SIZE = 5;
+
+let audioContext = null;
+let audioStarted = false;
+let automaticMode = true;
+let positionX = 0;
+let currentColumn = 0;
+let sessionId = 0;
+
+let currentCellPlayer = null;
+let dronePlayer = null;
+let currentCellGain = null;
+let droneGain = null;
+
+let activeVersions = Array(GRID_SIZE).fill("original");
+let generationPollTimer = null;
+let statusPollTimer = null;
+let lastGenerationJob = null;
+let transitionInProgress = false;
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(id, message) {
+    $(id).textContent = message;
+}
+
+function getEmotionParams() {
+    return {
+        intensity_a: Number($("intensityA").value),
+        valence_a: Number($("valenceA").value),
+        intensity_b: Number($("intensityB").value),
+        valence_b: Number($("valenceB").value)
+    };
+}
+
+function refreshEmotionLabels() {
+    for (const [id, digits] of [
+        ["intensityA", 2], ["valenceA", 2],
+        ["intensityB", 2], ["valenceB", 2]
+    ]) {
+        $(id + "Value").textContent =
+            Number($(id).value).toFixed(digits);
+    }
+}
+
+function drawGrid() {
+    const grid = $("grid");
+    grid.innerHTML = "";
+
+    for (let i = 0; i < GRID_SIZE; i++) {
+        const cell = document.createElement("div");
+        cell.id = "cell-" + i;
+        cell.className = "cell";
+        cell.innerHTML = `Cell ${i}<br><small>${activeVersions[i]}</small>`;
+        grid.appendChild(cell);
+    }
+
+    highlightCell(currentColumn);
+}
+
+function highlightCell(column) {
+    currentColumn = Math.max(0, Math.min(GRID_SIZE - 1, column));
+
+    for (let i = 0; i < GRID_SIZE; i++) {
+        const el = $("cell-" + i);
+        if (!el) continue;
+
+        el.classList.toggle("active", i === currentColumn);
+        el.innerHTML = `Cell ${i}<br><small>${activeVersions[i]}</small>`;
+    }
+}
+
+function getCrossfadeSeconds() {
+    return Number($("crossfade").value);
+}
+
+function createCellPlayer(column, version) {
+    const audio = new Audio(
+        `/audio/${column}?version=${encodeURIComponent(version)}&t=${Date.now()}`
+    );
+
+    audio.loop = true;
+    audio.preload = "auto";
+    audio.crossOrigin = "anonymous";
+
+    const source = audioContext.createMediaElementSource(audio);
+    const gain = audioContext.createGain();
+    gain.gain.value = 0;
+
+    source.connect(gain);
+    gain.connect(audioContext.destination);
+
+    return { audio, gain, source, column, version };
+}
+
+function fadeGain(gainNode, from, to, seconds) {
+    const now = audioContext.currentTime;
+    const end = now + Math.max(0.05, seconds);
+
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.setValueAtTime(from, now);
+    gainNode.gain.linearRampToValueAtTime(to, end);
+}
+
+async function crossfadeToCell(column, force = false) {
+    if (!audioStarted || !audioContext) return;
+    if (transitionInProgress) return;
+
+    const version = activeVersions[column] || "original";
+
+    if (
+        !force &&
+        currentCellPlayer &&
+        currentCellPlayer.column === column &&
+        currentCellPlayer.version === version
+    ) {
+        return;
+    }
+
+    transitionInProgress = true;
+
+    const mySession = sessionId;
+    const nextPlayer = createCellPlayer(column, version);
+    const oldPlayer = currentCellPlayer;
+    const duration = getCrossfadeSeconds();
+
+    try {
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(
+                () => reject(new Error("Audio load timed out")),
+                15000
+            );
+
+            nextPlayer.audio.addEventListener("canplay", () => {
+                clearTimeout(timeout);
+                resolve();
+            }, { once: true });
+
+            nextPlayer.audio.addEventListener("error", () => {
+                clearTimeout(timeout);
+                reject(new Error(
+                    `Could not load cell ${column} version ${version}`
+                ));
+            }, { once: true });
+
+            nextPlayer.audio.load();
+        });
+
+        await nextPlayer.audio.play();
+
+        if (!audioStarted || mySession !== sessionId) {
+            nextPlayer.audio.pause();
+            nextPlayer.audio.src = "";
+            transitionInProgress = false;
+            return;
+        }
+
+        const cellVolume = Number($("cellVolume").value);
+
+        nextPlayer.gain.gain.setValueAtTime(
+            0,
+            audioContext.currentTime
+        );
+
+        fadeGain(nextPlayer.gain, 0, cellVolume, duration);
+
+        if (oldPlayer) {
+            fadeGain(
+                oldPlayer.gain,
+                oldPlayer.gain.gain.value,
+                0,
+                duration
+            );
+        }
+
+        currentCellPlayer = nextPlayer;
+        currentCellGain = nextPlayer.gain;
+        highlightCell(column);
+
+        setStatus(
+            "playbackStatus",
+            `Playing cell ${column} · version ${version}`
+        );
+
+        if (oldPlayer) {
+            setTimeout(() => {
+                oldPlayer.audio.pause();
+                oldPlayer.audio.removeAttribute("src");
+                oldPlayer.audio.load();
+
+                try { oldPlayer.source.disconnect(); } catch (_) {}
+                try { oldPlayer.gain.disconnect(); } catch (_) {}
+            }, duration * 1000 + 150);
+        }
+
+    } catch (error) {
+        nextPlayer.audio.pause();
+        nextPlayer.audio.removeAttribute("src");
+        nextPlayer.audio.load();
+
+        try { nextPlayer.source.disconnect(); } catch (_) {}
+        try { nextPlayer.gain.disconnect(); } catch (_) {}
+
+        setStatus("playbackStatus", error.message);
+
+    } finally {
+        transitionInProgress = false;
+    }
+}
+
+async function startDrone() {
+    if (!audioContext || dronePlayer) return;
+
+    const audio = new Audio(`/audio/drone?t=${Date.now()}`);
+    audio.loop = true;
+    audio.preload = "auto";
+    audio.crossOrigin = "anonymous";
+
+    const source = audioContext.createMediaElementSource(audio);
+    const gain = audioContext.createGain();
+
+    gain.gain.value = Number($("droneVolume").value);
+
+    source.connect(gain);
+    gain.connect(audioContext.destination);
+
+    dronePlayer = { audio, source, gain };
+    droneGain = gain;
+
+    try {
+        await audio.play();
+    } catch (error) {
+        setStatus(
+            "playbackStatus",
+            "Drone could not start. Check that audio/drone.mp3 exists."
+        );
+    }
+}
+
+async function startAudio() {
+    if (audioStarted) return;
+
+    audioContext = audioContext || new (
+        window.AudioContext || window.webkitAudioContext
+    )();
+
+    await audioContext.resume();
+
+    await pollStatus();
+
+    sessionId += 1;
+    audioStarted = true;
+
+    $("start").disabled = true;
+    $("stop").disabled = false;
+
+    await startDrone();
+
+    const column = Math.max(
+        0,
+        Math.min(GRID_SIZE - 1, Math.round(positionX))
+    );
+
+    await crossfadeToCell(column, true);
+    startStatusPolling();
+}
+
+function stopAudio() {
+    audioStarted = false;
+    sessionId += 1;
+    transitionInProgress = false;
+
+    if (currentCellPlayer) {
+        currentCellPlayer.audio.pause();
+        currentCellPlayer.audio.removeAttribute("src");
+        currentCellPlayer.audio.load();
+
+        try { currentCellPlayer.source.disconnect(); } catch (_) {}
+        try { currentCellPlayer.gain.disconnect(); } catch (_) {}
+
+        currentCellPlayer = null;
+        currentCellGain = null;
+    }
+
+    if (dronePlayer) {
+        dronePlayer.audio.pause();
+        dronePlayer.audio.removeAttribute("src");
+        dronePlayer.audio.load();
+
+        try { dronePlayer.source.disconnect(); } catch (_) {}
+        try { dronePlayer.gain.disconnect(); } catch (_) {}
+
+        dronePlayer = null;
+        droneGain = null;
+    }
+
+    $("start").disabled = false;
+    $("stop").disabled = true;
+
+    setStatus("playbackStatus", "Audio stopped.");
+}
+
+async function pollPosition() {
+    const response = await fetch("/position", { cache: "no-store" });
+
+    if (!response.ok) {
+        throw new Error("Position request failed");
+    }
+
+    const data = await response.json();
+    positionX = Number(data.x) || 0;
+
+    if (automaticMode) {
+        $("manualX").value = positionX;
+        $("manualValue").textContent = positionX.toFixed(2);
+    }
+
+    const column = Math.max(
+        0,
+        Math.min(GRID_SIZE - 1, Number(data.column) || 0)
+    );
+
+    if (audioStarted && column !== currentColumn) {
+        await crossfadeToCell(column);
+    } else if (!audioStarted) {
+        highlightCell(column);
+    }
+
+    return data;
+}
+
+async function pollStatus() {
+    try {
+        const response = await fetch("/api/status", {
+            cache: "no-store"
+        });
+
+        if (!response.ok) {
+            throw new Error("Status request failed");
+        }
+
+        const data = await response.json();
+        const previousVersions = [...activeVersions];
+
+        for (let i = 0; i < GRID_SIZE; i++) {
+            const cell = data.cells[String(i)];
+
+            if (cell && cell.version) {
+                activeVersions[i] = cell.version;
+            }
+        }
+
+        positionX = Number(data.position.x) || 0;
+
+        if (automaticMode) {
+            $("manualX").value = positionX;
+            $("manualValue").textContent = positionX.toFixed(2);
+        }
+
+        const column = Math.max(
+            0,
+            Math.min(GRID_SIZE - 1, Number(data.column) || 0)
+        );
+
+        const changedCurrentCell =
+            activeVersions[column] !== previousVersions[column];
+
+        drawGrid();
+
+        if (audioStarted && changedCurrentCell) {
+            await crossfadeToCell(column, true);
+        } else if (audioStarted && column !== currentColumn) {
+            await crossfadeToCell(column);
+        } else if (!audioStarted) {
+            highlightCell(column);
+        }
+
+        const beaconA = data.beacons.a == null
+            ? "not seen"
+            : `${data.beacons.a.toFixed(0)} dBm`;
+
+        const beaconB = data.beacons.b == null
+            ? "not seen"
+            : `${data.beacons.b.toFixed(0)} dBm`;
+
+        const gpio = data.gpio || {};
+        const emotions = data.emotion_parameters || {};
+
+        setStatus(
+            "systemStatus",
+            `Mode: ${data.mode}\n` +
+            `Position x: ${positionX.toFixed(2)}\n` +
+            `Column: ${column}\n` +
+            `Beacon A: ${beaconA}\n` +
+            `Beacon B: ${beaconB}\n` +
+            `BLE: ${data.ble.message}\n` +
+            `GPIO: ${gpio.message || "Status unavailable"}\n` +
+            `Last GPIO button: ${gpio.last_button ?? "None"}\n` +
+            `Intensity A: ${Number(emotions.intensity_a ?? 0.5).toFixed(2)}\n` +
+            `Valence A: ${Number(emotions.valence_a ?? 0).toFixed(2)}\n` +
+            `Intensity B: ${Number(emotions.intensity_b ?? 0.5).toFixed(2)}\n` +
+            `Valence B: ${Number(emotions.valence_b ?? 0).toFixed(2)}\n` +
+            `Cell versions: ${activeVersions.join(", ")}`
+        );
+
+        if (data.generation) {
+            updateGenerationStatus(data.generation);
+        }
+
+    } catch (error) {
+        setStatus(
+            "systemStatus",
+            `Server connection error: ${error.message}`
+        );
+    }
+}
+
+function startStatusPolling() {
+    if (statusPollTimer) {
+        clearInterval(statusPollTimer);
+    }
+
+    statusPollTimer = setInterval(pollStatus, 1200);
+}
+
+async function setMode(mode) {
+    const response = await fetch("/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+    });
+
+    if (!response.ok) {
+        throw new Error(await response.text());
+    }
+
+    automaticMode = mode === "automatic";
+
+    await pollStatus();
+}
+
+async function setManualPosition(x) {
+    positionX = Number(x);
+
+    await fetch("/position", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ x: positionX, y: 0 })
+    });
+
+    $("manualValue").textContent = positionX.toFixed(2);
+
+    if (audioStarted) {
+        await crossfadeToCell(Math.round(positionX));
+    } else {
+        highlightCell(Math.round(positionX));
+    }
+}
+
+async function saveEmotions() {
+    const response = await fetch("/api/emotions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(getEmotionParams())
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+        throw new Error(
+            result.detail || "Could not save emotion settings"
+        );
+    }
+
+    setStatus(
+        "generationStatus",
+        "Emotion settings saved. No audio generation has been started."
+    );
+}
+
+function updateGenerationStatus(state) {
+    const progress = `${state.progress || 0}/${state.total || GRID_SIZE}`;
+
+    let message =
+        `${state.message || state.status}\nStatus: ${state.status}`;
+
+    if (state.status === "running" || state.status === "queued") {
+        message += `\nCells completed: ${progress}`;
+    }
+
+    if (state.error) {
+        message += `\nError: ${state.error}`;
+    }
+
+    setStatus("generationStatus", message);
+
+    $("generate").disabled =
+        state.status === "running" || state.status === "queued";
+}
+
+async function pollGenerationJob(jobId) {
+    try {
+        const response = await fetch(
+            `/api/generation/${encodeURIComponent(jobId)}`,
+            { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+            throw new Error(await response.text());
+        }
+
+        const state = await response.json();
+
+        updateGenerationStatus(state);
+        await pollStatus();
+
+        if (
+            state.status === "completed" ||
+            state.status === "failed"
+        ) {
+            if (generationPollTimer) {
+                clearInterval(generationPollTimer);
+            }
+
+            generationPollTimer = null;
+            $("generate").disabled = false;
+        }
+
+    } catch (error) {
+        setStatus(
+            "generationStatus",
+            `Could not poll generation job: ${error.message}`
+        );
+
+        $("generate").disabled = false;
+
+        if (generationPollTimer) {
+            clearInterval(generationPollTimer);
+        }
+
+        generationPollTimer = null;
+    }
+}
+
+async function startGeneration() {
+    if (generationPollTimer) {
+        clearInterval(generationPollTimer);
+    }
+
+    $("generate").disabled = true;
+
+    setStatus(
+        "generationStatus",
+        "Submitting generation request..."
+    );
+
+    try {
+        const response = await fetch("/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(getEmotionParams())
+        });
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                result.detail || "Generation request failed"
+            );
+        }
+
+        lastGenerationJob = result.job_id;
+
+        setStatus(
+            "generationStatus",
+            `Generation queued: ${result.job_id}\n` +
+            "Each cell will become available as soon as its audio is ready."
+        );
+
+        await pollGenerationJob(lastGenerationJob);
+
+        generationPollTimer = setInterval(
+            () => pollGenerationJob(lastGenerationJob),
+            2500
+        );
+
+    } catch (error) {
+        $("generate").disabled = false;
+        setStatus("generationStatus", error.message);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// UI events
+// ---------------------------------------------------------------------------
+
+$("start").addEventListener("click", () => {
+    startAudio().catch(
+        error => setStatus("playbackStatus", error.message)
+    );
+});
+
+$("stop").addEventListener("click", stopAudio);
+
+$("auto").addEventListener("click", async () => {
+    try {
+        await setMode("automatic");
+        setStatus(
+            "playbackStatus",
+            "Automatic positioning enabled."
+        );
+    } catch (error) {
+        setStatus("playbackStatus", error.message);
+    }
+});
+
+$("manual").addEventListener("click", async () => {
+    try {
+        await setMode("manual");
+        setStatus(
+            "playbackStatus",
+            "Manual positioning enabled."
+        );
+    } catch (error) {
+        setStatus("playbackStatus", error.message);
+    }
+});
+
+$("manualX").addEventListener("input", event => {
+    $("manualValue").textContent =
+        Number(event.target.value).toFixed(2);
+
+    if (!automaticMode) {
+        setManualPosition(event.target.value).catch(console.error);
+    }
+});
+
+$("crossfade").addEventListener("input", event => {
+    $("crossfadeValue").textContent =
+        Number(event.target.value).toFixed(1) + " s";
+});
+
+$("cellVolume").addEventListener("input", event => {
+    if (currentCellGain && audioContext) {
+        currentCellGain.gain.setTargetAtTime(
+            Number(event.target.value),
+            audioContext.currentTime,
+            0.05
+        );
+    }
+});
+
+$("droneVolume").addEventListener("input", event => {
+    if (droneGain && audioContext) {
+        droneGain.gain.setTargetAtTime(
+            Number(event.target.value),
+            audioContext.currentTime,
+            0.05
+        );
+    }
+});
+
+for (const id of [
+    "intensityA",
+    "valenceA",
+    "intensityB",
+    "valenceB"
+]) {
+    $(id).addEventListener("input", refreshEmotionLabels);
+}
+
+$("saveEmotions").addEventListener("click", () => {
+    saveEmotions().catch(error =>
+        setStatus("generationStatus", error.message)
+    );
+});
+
+$("generate").addEventListener("click", startGeneration);
+
+
+// ---------------------------------------------------------------------------
+// Initialize browser UI
+// ---------------------------------------------------------------------------
+
+$("stop").disabled = true;
+
+refreshEmotionLabels();
+drawGrid();
+pollStatus();
+startStatusPolling();
+
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # Startup / shutdown
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
-async def startup() -> None:
+async def startup():
     global ble_task
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-    for col in range(GRID_SIZE):
-        path = get_audio_path(col)
-        print(
-            f"{'Found' if path.is_file() else 'Missing'} audio: {path}"
-        )
+    missing = [
+        str(AUDIO_DIR / f"cell_{col}.mp3")
+        for col in range(GRID_SIZE)
+        if not (AUDIO_DIR / f"cell_{col}.mp3").is_file()
+    ]
 
-    drone = get_drone_path()
-    print(
-        f"{'Found' if drone.is_file() else 'Missing'} drone: {drone}"
-    )
+    if missing:
+        print("Warning: original audio files missing:")
 
+        for filename in missing:
+            print(f"  - {filename}")
+
+    if not (AUDIO_DIR / "drone.mp3").is_file():
+        print(f"Warning: missing {AUDIO_DIR / 'drone.mp3'}")
+
+    # Initialize GPIO buttons before accepting requests.
+    initialize_gpio_buttons()
+
+    # Start the existing BLE positioning task.
     ble_task = asyncio.create_task(ble_scanner_loop())
 
 
 @app.on_event("shutdown")
-async def shutdown() -> None:
-    global ble_task
+async def shutdown():
+    global ble_task, generation_task
 
-    if ble_task is not None:
+    if ble_task:
         ble_task.cancel()
+
         try:
             await ble_task
         except asyncio.CancelledError:
             pass
 
+    # Release GPIO resources.
+    for button in gpio_buttons.values():
+        button.close()
 
-# ------------------------------------------------------------
-# API endpoints
-# ------------------------------------------------------------
-
-@app.get("/position")
-def get_position() -> dict:
-    with state_lock:
-        position = dict(current_position)
-        source = position_source
-        col = current_column if source == "ble" else column_from_x(position["x"])
-
-    return {
-        "position": position,
-        "column": col,
-        "audio_url": f"/audio/{col}",
-        "source": source,
-        "mode": position_mode,
-    }
-
-
-@app.post("/position")
-def set_manual_position(position: Position) -> dict:
-    global position_source, position_mode, current_column
+    gpio_buttons.clear()
 
     with state_lock:
-        position_mode = "manual"
-        position_source = "manual"
-        current_position["x"] = position.x
-        current_position["y"] = position.y
-        current_column = column_from_x(position.x)
-
-        col = current_column
-
-    return {
-        "status": "ok",
-        "position": dict(current_position),
-        "column": col,
-        "audio_url": f"/audio/{col}",
-    }
-
-
-@app.post("/mode")
-def set_mode(mode: Mode) -> dict:
-    global position_mode, position_source, last_estimated_x
-
-    if mode.mode not in ("ble", "manual"):
-        raise HTTPException(
-            status_code=400,
-            detail="Mode must be 'ble' or 'manual'",
-        )
-
-    with state_lock:
-        position_mode = mode.mode
-
-        if mode.mode == "ble":
-            position_source = "ble"
-            last_estimated_x = None
-        else:
-            position_source = "manual"
-
-    return {"status": "ok", "mode": mode.mode}
-
-
-@app.get("/audio/drone")
-def stream_drone() -> FileResponse:
-    path = get_drone_path()
-
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Background drone not found: drone.mp3",
-        )
-
-    return FileResponse(
-        path,
-        media_type="audio/mpeg",
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/audio/{col}")
-def stream_audio(col: int) -> FileResponse:
-    if col < 0 or col >= GRID_SIZE:
-        raise HTTPException(status_code=404, detail="Invalid column")
-
-    path = get_audio_path(col)
-
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Audio file not found: {path.name}",
-        )
-
-    return FileResponse(
-        path,
-        media_type="audio/mpeg",
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/health")
-def health() -> dict:
-    available = get_available_columns()
-    now = time.monotonic()
-
-    with state_lock:
-        beacons = {}
-
-        for beacon_id, record in beacon_rssi.items():
-            last_seen = record["last_seen"]
-            age = (
-                None if last_seen is None
-                else round(now - last_seen, 2)
-            )
-
-            beacons[BEACON_NAMES[beacon_id]] = {
-                "rssi": (
-                    None if record["rssi"] is None
-                    else round(record["rssi"], 1)
-                ),
-                "age_seconds": age,
-                "samples": record["samples"],
-                "fresh": (
-                    last_seen is not None
-                    and now - last_seen <= RSSI_STALE_SECONDS
-                ),
-            }
-
-        position = dict(current_position)
-        source = position_source
-        mode = position_mode
-        ble = dict(ble_status)
-        col = current_column if source == "ble" else column_from_x(position["x"])
-
-    return {
-        "status": "ok" if available else "no_audio",
-        "loaded_columns": available,
-        "missing_files": [
-            str(get_audio_path(c))
-            for c in range(GRID_SIZE)
-            if c not in available
-        ],
-        "drone_available": get_drone_path().is_file(),
-        "position": position,
-        "position_source": source,
-        "position_mode": mode,
-        "current_column": col,
-        "ble": {
-            **ble,
-            "beacons": beacons,
-        },
-    }
-
-
-# ------------------------------------------------------------
-# Browser UI
-# ------------------------------------------------------------
-
-@app.get("/")
-def home() -> HTMLResponse:
-        return HTMLResponse(r"""
-    <!doctype html>
-    <html lang="en">
-    <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Gallery Audio Grid</title>
-    <style>
-    body {
-        font-family: sans-serif;
-        max-width: 760px;
-        margin: 40px auto;
-        padding: 0 20px;
-    }
-    .control { margin: 22px 0; }
-    input[type=range] { width: 100%; }
-    button { padding: 10px 16px; margin: 4px; cursor: pointer; }
-    #grid {
-        display: grid;
-        grid-template-columns: repeat(5, 1fr);
-        gap: 5px;
-        margin-top: 20px;
-    }
-    .cell {
-        background: #eee;
-        padding: 20px 5px;
-        text-align: center;
-        border-radius: 5px;
-    }
-    .active { background: #a7d8ff; }
-    #status { margin-top: 20px; line-height: 1.5; overflow-wrap: anywhere; }
-    .note { color: #555; font-size: .9rem; }
-    .value { font-weight: bold; }
-    </style>
-    </head>
-    <body>
-    <h1>Gallery Audio Grid</h1>
-
-    <p>
-    The Raspberry Pi estimates your position between two BLE beacons.
-    Moving between columns changes the soundscape; the drone continues
-    in the background.
-    </p>
-
-    <button id="start">Start audio</button>
-    <button id="stop" disabled>Stop audio</button>
-    <button id="bleMode">Use BLE position</button>
-    <button id="manualMode">Manual test mode</button>
-
-    <div class="control">
-    <label for="crossfade">
-    Crossfade duration: <span id="crossfadeValue">3.00</span> seconds
-    </label>
-    <input id="crossfade" type="range" min=".25" max="10" step=".25" value="3">
-    </div>
-
-    <div class="control">
-    <label for="droneVolume">
-    Drone volume: <span id="droneValue">15</span>%
-    </label>
-    <input id="droneVolume" type="range" min="0" max="50" value="15">
-    </div>
-
-    <div class="control">
-    <label for="trackVolume">
-    Soundscape volume: <span id="trackValue">100</span>%
-    </label>
-    <input id="trackVolume" type="range" min="0" max="100" value="100">
-    </div>
-
-    <div id="manualControls" hidden>
-    <div class="control">
-    <label for="x">Position X: <span id="xvalue">2.50</span></label>
-    <input id="x" type="range" min="0" max="5" step=".05" value="2.5">
-    </div>
-    <button id="sendManual">Send manual position</button>
-    </div>
-
-    <div id="status">Waiting for BLE readings.</div>
-    <div id="grid"></div>
-
-    <script>
-    const SIZE = 5;
-    const $ = id => document.getElementById(id);
-
-    let audioContext = null;
-    let players = [];
-    let dronePlayer = null;
-    let trackMasterGain = null;
-    let droneMasterGain = null;
-
-    let activeIndex = 0;
-    let currentColumn = null;
-    let audioStarted = false;
-    let automaticMode = true;
-    let transitionId = 0;
-    let cleanupTimer = null;
-    let pollTimer = null;
-    let lastPosition = null;
-
-    for (let row = 0; row < SIZE; row++) {
-        for (let col = 0; col < SIZE; col++) {
-            const cell = document.createElement("div");
-            cell.className = "cell";
-            cell.id = `cell-${col}-${row}`;
-            cell.textContent = `Column ${col}`;
-            $("grid").appendChild(cell);
-        }
-    }
-
-    function updateGrid(col) {
-        document.querySelectorAll(".cell").forEach(cell => {
-            cell.classList.toggle("active", cell.id.startsWith(`cell-${col}-`));
-        });
-    }
-
-    function createPlayer(destination) {
-        const audio = new Audio();
-        audio.preload = "none";
-        audio.loop = true;
-        audio.crossOrigin = "anonymous";
-
-        const source = audioContext.createMediaElementSource(audio);
-        const gain = audioContext.createGain();
-        source.connect(gain);
-        gain.connect(destination);
-        gain.gain.value = 0;
-
-        return { audio, gain, targetColumn: null };
-    }
-
-    function initializeAudio() {
-        if (audioContext) return;
-
-        audioContext = new AudioContext();
-
-        trackMasterGain = audioContext.createGain();
-        trackMasterGain.gain.value = Number($("trackVolume").value) / 100;
-        trackMasterGain.connect(audioContext.destination);
-
-        players = [
-            createPlayer(trackMasterGain),
-            createPlayer(trackMasterGain)
-        ];
-
-        droneMasterGain = audioContext.createGain();
-        droneMasterGain.gain.value = Number($("droneVolume").value) / 100;
-        droneMasterGain.connect(audioContext.destination);
-
-        dronePlayer = createPlayer(droneMasterGain);
-    }
-
-    function resetPlayer(player) {
-        player.audio.pause();
-        player.audio.removeAttribute("src");
-        player.audio.load();
-        player.targetColumn = null;
-
-        const now = audioContext.currentTime;
-        player.gain.gain.cancelScheduledValues(now);
-        player.gain.gain.setValueAtTime(0, now);
-    }
-
-    async function switchAudio(col, immediate = false) {
-        if (!audioStarted) return;
-
-        if (currentColumn === col &&
-            players.some(p => p.targetColumn === col && !p.audio.paused)) {
-            return;
-        }
-
-        const id = ++transitionId;
-        if (cleanupTimer !== null) clearTimeout(cleanupTimer);
-
-        let outgoingIndex = activeIndex;
-        let incomingIndex = 1 - activeIndex;
-
-        if (players[1 - activeIndex].gain.gain.value >
-            players[activeIndex].gain.gain.value) {
-            outgoingIndex = 1 - activeIndex;
-            incomingIndex = activeIndex;
-        }
-
-        const outgoing = players[outgoingIndex];
-        const incoming = players[incomingIndex];
-
-        const now = audioContext.currentTime;
-        for (const player of players) {
-            player.gain.gain.cancelScheduledValues(now);
-            player.gain.gain.setValueAtTime(player.gain.gain.value, now);
-        }
-
-        resetPlayer(incoming);
-        incoming.targetColumn = col;
-        incoming.audio.src = `/audio/${col}`;
-        incoming.audio.load();
-
-        const duration = immediate ? 0 : Number($("crossfade").value);
-        $("status").textContent = `Loading column ${col}...`;
-
-        try {
-            await incoming.audio.play();
-
-            if (id !== transitionId || !audioStarted) {
-                resetPlayer(incoming);
-                return;
-            }
-
-            const start = audioContext.currentTime;
-            incoming.gain.gain.cancelScheduledValues(start);
-            incoming.gain.gain.setValueAtTime(0, start);
-
-            outgoing.gain.gain.cancelScheduledValues(start);
-            outgoing.gain.gain.setValueAtTime(
-                outgoing.gain.gain.value, start
-            );
-
-            if (duration <= .01) {
-                incoming.gain.gain.setValueAtTime(1, start);
-                outgoing.gain.gain.setValueAtTime(0, start);
-            } else {
-                incoming.gain.gain.linearRampToValueAtTime(1, start + duration);
-                outgoing.gain.gain.linearRampToValueAtTime(0, start + duration);
-            }
-
-            activeIndex = incomingIndex;
-            currentColumn = col;
-            updateGrid(col);
-
-            cleanupTimer = setTimeout(() => {
-                if (id === transitionId) resetPlayer(outgoing);
-            }, duration * 1000 + 150);
-
-            $("status").textContent =
-                `Playing column ${col}; crossfade ${duration.toFixed(2)} s.`;
-        } catch (error) {
-            if (id === transitionId) {
-                $("status").textContent =
-                    `Could not play column ${col}: ${error.message}`;
-            }
-        }
-    }
-
-    async function startDrone() {
-        dronePlayer.audio.src = "/audio/drone";
-        dronePlayer.audio.load();
-
-        try {
-            await dronePlayer.audio.play();
-            const now = audioContext.currentTime;
-            dronePlayer.gain.gain.cancelScheduledValues(now);
-            dronePlayer.gain.gain.setValueAtTime(0, now);
-            dronePlayer.gain.gain.linearRampToValueAtTime(1, now + 1.5);
-        } catch (error) {
-            $("status").textContent = "Drone unavailable: " + error.message;
-        }
-    }
-
-    async function pollPosition() {
-        try {
-            const response = await fetch("/position", { cache: "no-store" });
-            if (!response.ok) throw new Error("Position request failed");
-
-            const data = await response.json();
-            const x = Number(data.position.x);
-            const col = Number(data.column);
-            lastPosition = { x, col };
-
-            if (!automaticMode) return;
-
-            $("x").value = x;
-            $("xvalue").textContent = x.toFixed(2);
-            updateGrid(col);
-
-            if (audioStarted && col !== currentColumn) {
-                await switchAudio(col);
-            } else if (!audioStarted) {
-                currentColumn = col;
-            }
-
-            $("status").textContent =
-                `BLE mode | X=${x.toFixed(2)} | Column=${col} | Source=${data.source}`;
-        } catch (error) {
-            $("status").textContent = "Position error: " + error.message;
-        }
-    }
-
-    function startPolling() {
-        if (pollTimer !== null) clearInterval(pollTimer);
-        pollPosition();
-        pollTimer = setInterval(pollPosition, 500);
-    }
-
-    $("start").addEventListener("click", async () => {
-        initializeAudio();
-
-        try {
-            await audioContext.resume();
-            audioStarted = true;
-            $("start").disabled = true;
-            $("stop").disabled = false;
-
-            startDrone();
-
-            if (automaticMode) {
-                await pollPosition();
-                const col = lastPosition ? lastPosition.col : 2;
-                currentColumn = null;
-                await switchAudio(col, true);
-            } else {
-                const col = Math.min(4, Math.floor(Number($("x").value)));
-                currentColumn = null;
-                await switchAudio(col, true);
-            }
-
-            startPolling();
-        } catch (error) {
-            $("status").textContent = "Could not start audio: " + error.message;
-            audioStarted = false;
-            $("start").disabled = false;
-            $("stop").disabled = true;
-        }
-    });
-
-    $("stop").addEventListener("click", () => {
-        transitionId++;
-        if (cleanupTimer !== null) clearTimeout(cleanupTimer);
-
-        audioStarted = false;
-        players.forEach(resetPlayer);
-        if (dronePlayer) resetPlayer(dronePlayer);
-
-        currentColumn = null;
-        $("start").disabled = false;
-        $("stop").disabled = true;
-        $("status").textContent = "Audio stopped.";
-    });
-
-    $("bleMode").addEventListener("click", async () => {
-        await fetch("/mode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: "ble" })
-        });
-
-        automaticMode = true;
-        $("manualControls").hidden = true;
-        $("status").textContent = "BLE mode enabled.";
-        pollPosition();
-    });
-
-    $("manualMode").addEventListener("click", async () => {
-        await fetch("/mode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: "manual" })
-        });
-
-        automaticMode = false;
-        $("manualControls").hidden = false;
-        $("status").textContent = "Manual test mode enabled.";
-    });
-
-    $("sendManual").addEventListener("click", async () => {
-        const x = Number($("x").value);
-        $("xvalue").textContent = x.toFixed(2);
-
-        try {
-            const response = await fetch("/position", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ x, y: 0 })
-            });
-
-            if (!response.ok) throw new Error("Manual position update failed");
-
-            const data = await response.json();
-            const col = data.column;
-            updateGrid(col);
-
-            if (audioStarted && col !== currentColumn) {
-                await switchAudio(col);
-            } else {
-                currentColumn = col;
-            }
-
-            $("status").textContent =
-                `Manual X=${x.toFixed(2)} | Column=${col}`;
-        } catch (error) {
-            $("status").textContent = error.message;
-        }
-    });
-
-    $("crossfade").addEventListener("input", () => {
-        $("crossfadeValue").textContent =
-            Number($("crossfade").value).toFixed(2);
-    });
-
-    $("droneVolume").addEventListener("input", () => {
-        $("droneValue").textContent = $("droneVolume").value;
-
-        if (droneMasterGain && audioContext) {
-            droneMasterGain.gain.setTargetAtTime(
-                Number($("droneVolume").value) / 100,
-                audioContext.currentTime,
-                .05
-            );
-        }
-    });
-
-    $("trackVolume").addEventListener("input", () => {
-        $("trackValue").textContent = $("trackVolume").value;
-
-        if (trackMasterGain && audioContext) {
-            trackMasterGain.gain.setTargetAtTime(
-                Number($("trackVolume").value) / 100,
-                audioContext.currentTime,
-                .05
-            );
-        }
-    });
-
-    $("x").addEventListener("input", () => {
-        $("xvalue").textContent = Number($("x").value).toFixed(2);
-    });
-
-    startPolling();
-    </script>
-    </body>
-    </html>
-    """)
-
+        gpio_status["available"] = False
+        gpio_status["message"] = "GPIO buttons shut down."
+
+    # Generation runs in a worker thread. Do not delete generated files
+    # or files currently being used by browser clients during shutdown.
