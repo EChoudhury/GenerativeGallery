@@ -451,9 +451,9 @@ def main():
 
         elif args.command == "transition":
             client.transition(
-                input_audio=args.input,
+                source_path=args.input,
                 prompt=args.prompt,
-                output=args.output,
+                output_path=args.output,
                 duration=args.duration,
                 strength=args.strength,
             )

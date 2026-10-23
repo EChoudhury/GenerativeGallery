@@ -69,9 +69,10 @@ GENERATION_STRENGTH = 0.80
 INTENSITY_STABILITY_SECONDS = 5.0
 INTENSITY_WATCH_INTERVAL_SECONDS = 0.25
 
-RSSI_SMOOTHING_ALPHA = 0.25
-POSITION_SMOOTHING_ALPHA = 0.25
-BLE_SCAN_INTERVAL_SECONDS = 0.5
+RSSI_SMOOTHING_ALPHA = 0.45
+POSITION_SMOOTHING_ALPHA = 0.65
+BLE_SCAN_INTERVAL_SECONDS = 0.05
+BLE_SCAN_TIMEOUT_SECONDS = 0.35
 
 BASE_SOUND_PROMPT = (
     "A calming, immersive ambient soundscape for a contemporary art gallery. "
@@ -411,7 +412,7 @@ def normalize_address(address: str) -> str:
 
 
 async def ble_scanner_loop():
-    """Continuously scan for the two configured BLE beacons."""
+    """Continuously process advertisements from both configured beacons."""
     global beacon_rssi
 
     if not BEACON_A_ADDRESS or not BEACON_B_ADDRESS:
@@ -422,74 +423,87 @@ async def ble_scanner_loop():
             )
         return
 
-    with state_lock:
-        ble_status["running"] = True
-        ble_status["message"] = "Scanning for configured beacons."
+    last_seen = {"a": None, "b": None}
+    loop = asyncio.get_running_loop()
+
+    def on_advertisement(device, advertisement):
+        address = normalize_address(device.address)
+
+        if address == BEACON_A_ADDRESS:
+            key = "a"
+        elif address == BEACON_B_ADDRESS:
+            key = "b"
+        else:
+            return
+
+        rssi = getattr(advertisement, "rssi", None)
+        if rssi is None:
+            return
+
+        now = time.monotonic()
+        last_seen[key] = now
+
+        with state_lock:
+            old = beacon_rssi[key]
+            beacon_rssi[key] = (
+                float(rssi)
+                if old is None
+                else RSSI_SMOOTHING_ALPHA * float(rssi)
+                + (1.0 - RSSI_SMOOTHING_ALPHA) * old
+            )
+
+        # Recalculate position using the latest measurements.
+        # Keep processing lightweight inside the BLE callback.
+        if position_mode == "automatic":
+            update_position_from_rssi()
+
+    scanner = BleakScanner(detection_callback=on_advertisement)
 
     try:
+        await scanner.start()
+
+        with state_lock:
+            ble_status["running"] = True
+            ble_status["message"] = "Continuous BLE scanning active."
+
         while True:
-            try:
-                discovered = await BleakScanner.discover(
-                    timeout=1.0,
-                    return_adv=True,
-                )
+            await asyncio.sleep(0.25)
 
-                for address, result in discovered.items():
-                    device, advertisement = result
-                    normalized = normalize_address(address)
+            now = time.monotonic()
+            with state_lock:
+                stale = [
+                    key for key in ("a", "b")
+                    if last_seen[key] is None
+                    or now - last_seen[key] > 3.0
+                ]
 
-                    rssi = getattr(advertisement, "rssi", None)
-
-                    if rssi is None:
-                        rssi = getattr(device, "rssi", None)
-
-                    if rssi is None:
-                        continue
-
-                    with state_lock:
-                        if normalized == BEACON_A_ADDRESS:
-                            old = beacon_rssi["a"]
-
-                            beacon_rssi["a"] = (
-                                float(rssi)
-                                if old is None
-                                else RSSI_SMOOTHING_ALPHA * float(rssi)
-                                + (1.0 - RSSI_SMOOTHING_ALPHA) * old
-                            )
-
-                        elif normalized == BEACON_B_ADDRESS:
-                            old = beacon_rssi["b"]
-
-                            beacon_rssi["b"] = (
-                                float(rssi)
-                                if old is None
-                                else RSSI_SMOOTHING_ALPHA * float(rssi)
-                                + (1.0 - RSSI_SMOOTHING_ALPHA) * old
-                            )
-
-                with state_lock:
-                    automatic = position_mode == "automatic"
-
-                if automatic:
-                    update_position_from_rssi()
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                with state_lock:
-                    ble_status["message"] = f"BLE scan error: {exc}"
-
-            await asyncio.sleep(BLE_SCAN_INTERVAL_SECONDS)
+                if stale:
+                    ble_status["message"] = (
+                        "Scanning; waiting for fresh beacon data: "
+                        + ", ".join(stale)
+                    )
+                else:
+                    ble_status["message"] = (
+                        "Continuous scanning; both beacons recently seen."
+                    )
 
     except asyncio.CancelledError:
-        pass
+        raise
+
+    except Exception as exc:
+        with state_lock:
+            ble_status["message"] = f"BLE scanner error: {exc}"
+        print(f"[BLE] Scanner error: {exc}")
 
     finally:
+        try:
+            await scanner.stop()
+        except Exception:
+            pass
+
         with state_lock:
             ble_status["running"] = False
             ble_status["message"] = "BLE scanner stopped."
-
 
 # ---------------------------------------------------------------------------
 # Emotion-to-prompt mapping and generation
@@ -1576,12 +1590,27 @@ async function pollStatus() {
     }
 }
 
-function startStatusPolling() {
-    if (statusPollTimer) {
-        clearInterval(statusPollTimer);
-    }
+let positionPollTimer = null;
+let positionPollInFlight = false;
 
-    statusPollTimer = setInterval(pollStatus, 1200);
+function startStatusPolling() {
+    if (statusPollTimer) clearInterval(statusPollTimer);
+    if (positionPollTimer) clearInterval(positionPollTimer);
+
+    positionPollTimer = setInterval(async () => {
+        if (positionPollInFlight) return;
+
+        positionPollInFlight = true;
+        try {
+            await pollPosition();
+        } catch (error) {
+            console.warn("[POSITION]", error.message);
+        } finally {
+            positionPollInFlight = false;
+        }
+    }, 150);
+
+    statusPollTimer = setInterval(pollStatus, 1500);
 }
 
 async function setMode(mode) {
