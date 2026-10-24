@@ -223,4 +223,4 @@ __marimo__/
 # Local curator platform artwork uploads, audio, task history and database
 curator_platform/data/
 assets/
-
+.DS_Store
