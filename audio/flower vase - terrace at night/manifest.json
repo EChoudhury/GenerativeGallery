@@ -1,0 +1,37 @@
+{
+  "grid_id": "2f918326-126c-4bc5-a690-512ef5f2ce1b",
+  "gallery_name": "flower vase → terrace at night",
+  "artwork_titles": [
+    "flower vase",
+    "terrace at night"
+  ],
+  "method": "inpaint",
+  "created_at": "2026-10-22T10:58:46.947428+00:00",
+  "cells": [
+    {
+      "file": "cell_0.mp3",
+      "label": "flower vase",
+      "duration": 30.0
+    },
+    {
+      "file": "cell_1.mp3",
+      "label": "Toward flower vase",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_2.mp3",
+      "label": "Shared middle",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_3.mp3",
+      "label": "Toward terrace at night",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_4.mp3",
+      "label": "terrace at night",
+      "duration": 30.0
+    }
+  ]
+}

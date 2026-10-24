@@ -5,3 +5,6 @@ sounddevice>=0.4.6
 fastapi
 uvicorn
 numpy
+gpiozero
+dotenv
+bleak
