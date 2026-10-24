@@ -6,3 +6,5 @@ fastapi
 uvicorn
 numpy
 gpiozero
+dotenv
+bleak

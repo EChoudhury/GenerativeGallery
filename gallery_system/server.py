@@ -42,7 +42,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from gpiozero import Button
 
-from generate_assets import StabilityAudioClient, build_emotion_prompt
+from gallery_system.generate_assets import StabilityAudioClient, build_emotion_prompt
 
 load_dotenv()
 
@@ -56,7 +56,8 @@ app = FastAPI(title="Gallery Grid Audio Server")
 GRID_SIZE = 5
 GRID_MAX_X = 5.0
 
-AUDIO_DIR = Path("audio")
+ROOT = Path(__file__).resolve().parent.parent
+AUDIO_DIR = ROOT / "audio"
 GENERATED_DIR = AUDIO_DIR / "generated"
 
 BEACON_A_ADDRESS = os.getenv("BEACON_A_ADDRESS", "").strip().lower()
