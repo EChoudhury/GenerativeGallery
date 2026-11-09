@@ -1,8 +1,0 @@
-numpy>=1.26
-scipy>=1.11
-soundfile>=0.12
-sounddevice>=0.4.6
-fastapi
-uvicorn
-numpy
-gpiozero
