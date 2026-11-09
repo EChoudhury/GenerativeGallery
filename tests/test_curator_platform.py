@@ -286,15 +286,22 @@ class CuratorPlatformTests(unittest.TestCase):
         grid = self.json('/api/grids/'+job['result']['grid_id'])
         self.assertEqual(grid['middle_interval'], [8, 20])
 
-    def test_only_one_task_runs_and_stability_request_polls_without_resubmitting(self):
+    def test_concurrent_capacity_and_stability_request_polls_without_resubmitting(self):
         with patch.object(platform.EXECUTOR, 'submit') as submit:
             artwork = self.artwork()
             body = {'request_id': str(uuid.uuid4()), 'kind': 'music', 'artwork_id': artwork['id'], 'prompt': 'Piano'}
             self.json('/api/jobs', body)
             self.json('/api/jobs', body)
+            for _ in range(platform.MAX_CONCURRENT_JOBS-1):
+                self.json('/api/jobs', {**body, 'request_id': str(uuid.uuid4())})
             other = {**body, 'request_id': str(uuid.uuid4())}
             self.assertEqual(self.call('/api/jobs', other)[0], 409)
-            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(submit.call_count, platform.MAX_CONCURRENT_JOBS)
+            # Completing one job frees a slot without resubmitting any other job.
+            first = self.json('/api/jobs', body)
+            platform.update_job(first['id'], status='completed')
+            self.json('/api/jobs', other)
+            self.assertEqual(submit.call_count, platform.MAX_CONCURRENT_JOBS+1)
         # Use the real request implementation, not the high-level FakeAudio.
         real_class = self.real_audio_class
         response = Mock(status_code=202)
@@ -332,6 +339,68 @@ class CuratorPlatformTests(unittest.TestCase):
         self.assertNotEqual(next_grid['mp3_export']['directory'], str(folder))
         self.assertEqual((folder/'cell_2.mp3').read_bytes(), before)
         self.assertEqual(json.loads((folder/'manifest.json').read_text())['grid_id'], grid['id'])
+
+    def test_transition_export_with_non_utf8_default_encoding(self):
+        a, b, _, _ = self.saved_pair()
+        original_open = Path.open
+
+        def legacy_open(path, mode='r', buffering=-1, encoding=None, errors=None, newline=None):
+            if 'b' not in mode and encoding in (None, 'locale'):
+                encoding = 'cp1252'
+            return original_open(path, mode, buffering, encoding, errors, newline)
+
+        # Reproduce a host whose default text encoding cannot represent the arrow.
+        with patch.object(Path, 'open', legacy_open):
+            job = self.task('grid', a_id=a['id'], b_id=b['id'], context=8, bridge=4,
+                            method='inpaint', name='莫兰迪 → Mondrian')
+            self.assertEqual(job['status'], 'completed', job.get('error'))
+            grid = self.json('/api/grids/'+job['result']['grid_id'])
+            folder = Path(grid['mp3_export']['directory'])
+            self.assertEqual(platform.export_grid_mp3(grid)['directory'], str(folder))
+            self.assertIn('Curator', platform.index().body.decode('utf-8'))
+        report = json.loads((folder/'manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(report['gallery_name'], '莫兰迪 → Mondrian')
+        self.assertEqual([call[0] for call in FakeAudio.calls[-3:]], ['inpaint']*3)
+        for index in range(5):
+            self.assertEqual(sf.info(folder/f'cell_{index}.mp3').format, 'MP3')
+
+    def test_hosted_access_origin_and_public_opt_in(self):
+        from curator_platform.hosting import Hosting
+        hosting = Hosting.from_env(platform.ROOT, {
+            'CURATOR_PUBLIC_URL': 'https://gallery.example',
+            'CURATOR_PASSWORD': 'a-long-test-password'})
+        auth = 'Basic '+base64.b64encode(b'curator:a-long-test-password').decode()
+        with patch.object(platform, 'HOSTING', hosting):
+            self.assertEqual(self.call('/healthz')[0], 200)
+            for route in ['/', '/api/config', '/api/jobs', '/api/music', '/api/grids', '/static/app.js']:
+                self.assertEqual(self.call(route)[0], 401, route)
+                self.assertEqual(self.call(route, headers={'Authorization': auth})[0], 200, route)
+            headers = {'Authorization': auth, 'Origin': 'https://gallery.example'}
+            # Valid origin passes CSRF, then invalid input reaches ordinary validation.
+            self.assertEqual(self.call('/api/artworks', {}, headers=headers)[0], 422)
+            headers['Origin'] = 'https://evil.example'
+            self.assertEqual(self.call('/api/artworks', {}, headers=headers)[0], 403)
+            headers['Origin'] = 'https://gallery.example'
+            headers['X-Curator-Request'] = '0'
+            self.assertEqual(self.call('/api/artworks', {}, headers=headers)[0], 403)
+        public = Hosting.from_env(platform.ROOT, {'CURATOR_PUBLIC_URL': 'https://gallery.example',
+                                                   'CURATOR_PUBLIC_GENERATION': 'true'})
+        with patch.object(platform, 'HOSTING', public):
+            self.assertEqual(self.call('/api/config')[0], 200)
+            self.assertEqual(self.call('/api/artworks', {}, headers={'Origin': 'https://gallery.example'})[0], 422)
+            self.assertEqual(self.call('/api/artworks', {}, headers={'Origin': 'https://evil.example'})[0], 403)
+
+    def test_saved_artwork_history_and_cache_busting(self):
+        artwork = self.artwork()
+        self.assertEqual(self.json('/api/artworks')[0]['id'], artwork['id'])
+        status, headers, body = self.call('/')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Cache-Control'], 'no-store')
+        page = body.decode()
+        self.assertIn('/static/app.js?v=', page)
+        self.assertIn('/static/style.css?v=', page)
+        self.assertIn('id="artwork-history"', page)
+        self.assertEqual(self.call('/static/app.js')[1]['Cache-Control'], 'no-store')
 
     def test_named_library_recordings_survive_reopening_the_store(self):
         a, b, _, _ = self.saved_pair()

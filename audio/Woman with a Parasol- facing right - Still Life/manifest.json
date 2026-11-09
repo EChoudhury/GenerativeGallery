@@ -1,0 +1,37 @@
+{
+  "grid_id": "8171ab67-2e49-43c9-863c-4b7f6cc066e2",
+  "gallery_name": "Woman with a Parasol, facing right → Morandi · Still Life",
+  "artwork_titles": [
+    "Woman with a Parasol, facing right",
+    "Still Life"
+  ],
+  "method": "inpaint",
+  "created_at": "2026-10-22T21:21:48.567726+00:00",
+  "cells": [
+    {
+      "file": "cell_0.mp3",
+      "label": "Woman with a Parasol, facing right",
+      "duration": 30.0
+    },
+    {
+      "file": "cell_1.mp3",
+      "label": "Toward Woman with a Parasol, facing right",
+      "duration": 19.75
+    },
+    {
+      "file": "cell_2.mp3",
+      "label": "Shared middle",
+      "duration": 19.75
+    },
+    {
+      "file": "cell_3.mp3",
+      "label": "Toward Morandi · Still Life",
+      "duration": 19.75
+    },
+    {
+      "file": "cell_4.mp3",
+      "label": "Morandi · Still Life",
+      "duration": 27.0
+    }
+  ]
+}

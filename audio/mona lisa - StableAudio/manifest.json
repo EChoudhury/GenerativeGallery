@@ -1,0 +1,37 @@
+{
+  "grid_id": "28cecd83-2095-46d6-9bb5-f45a374376a3",
+  "gallery_name": "mona lisa → StableAudio",
+  "artwork_titles": [
+    "mona lisa",
+    "StableAudio"
+  ],
+  "method": "inpaint",
+  "created_at": "2026-10-23T13:48:45.878798+00:00",
+  "cells": [
+    {
+      "file": "cell_0.mp3",
+      "label": "mona lisa",
+      "duration": 30.0
+    },
+    {
+      "file": "cell_1.mp3",
+      "label": "Toward mona lisa",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_2.mp3",
+      "label": "Shared middle",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_3.mp3",
+      "label": "Toward StableAudio",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_4.mp3",
+      "label": "StableAudio",
+      "duration": 31.0
+    }
+  ]
+}

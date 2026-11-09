@@ -28,13 +28,13 @@ DeepSeek’s current [vision API](https://api-docs.deepseek.com/guides/vision/) 
 
 ## The workflow
 
-1. **Create a sound.** Upload a JPG, PNG or WebP under 8 MB, enter the artwork title and artist, and optionally add curator notes. Click **Use this artwork**. If you change artwork information later, save it again before generating.
+1. **Create a sound.** Upload a JPG, PNG or WebP under 8 MB, enter the artwork title and artist, and optionally add curator notes. Once the title, artist and image are ready, **Interpret artwork** becomes available. The artwork is saved automatically when you interpret or generate; there is no separate save step.
 2. **Interpret artwork.** DeepSeek receives the prepared image and your metadata. Read the interpretation, edit the music prompt, and choose the generation duration. A prompt’s requested tempo, key and looping behavior are musical targets, not guarantees.
 3. **Generate music.** Stability produces a complete WAV recording. The edited prompt is saved with it. Completed recordings can be reopened in **Recent generations**.
 4. **Create and save a loop.** Choose the excerpt’s start/end and a head/tail overlap, audition the result, then enter a music name and save it to the library. Local processing preserves the source recording. A 16-second excerpt with a 1-second overlap becomes a 15-second loop. The overlap must be shorter than half the excerpt.
 5. **Music library.** Listen, search, rename or download saved recordings. The saved name is also used for the numbered file, such as `Artwork name-001.wav`. Select two loops: the first is A, the second is B. Click **Connect these artworks**. If the approved earlier Mondrian and Morandi loop files exist on this Mac, they are copied into an initially empty library as imported recordings; no generation is needed for this import.
-6. **Between artworks.** Choose reference and bridge lengths, plus optional musical direction. Either generate the entire five-cell grid, or preview the bridge first and curate its middle before building the grid.
-7. **Listening grid.** Start listening. Move the position slider or click a cell to blend neighboring musical states. All five loops run on a shared playback clock. Position changes their gains with equal-power interpolation and an adjustable smoothing time; it does not restart the files at every boundary. This preserves playheads, but does not beat-match the independently generated cells.
+6. **Between artworks.** Choose reference and bridge lengths, plus optional musical direction. Click **Generate transition** to generate the shared middle and both neighboring connections in one workflow.
+7. **Listening field.** Start listening. Move the position slider or click a cell to blend neighboring musical states. All five loops run on a shared playback clock. Position changes their gains with equal-power interpolation and an adjustable smoothing time; it does not restart the files at every boundary. This preserves playheads, but does not beat-match the independently generated cells.
 
 ## How the transition and five cells are built
 
@@ -78,7 +78,7 @@ The selector initially favors inpainting-only; older grids without a `method` fi
 | Generate full grid directly — original hybrid | 1 Stability inpaint + 2 audio-to-audio requests |
 | Build grid from an existing bridge preview | 2 inpaint or 2 audio-to-audio requests, according to mode; the bridge is reused |
 
-Requests are user-triggered, one task runs at a time, and paid requests are not automatically retried. Submission IDs make an identical submission idempotent. Stability generation IDs are retained in task records. After a timeout or service restart, check your provider account before requesting another paid generation. Refreshing the page restores active task polling and saved work.
+Requests are user-triggered, up to three tasks run at a time, and paid requests are not automatically retried. Submission IDs make an identical submission idempotent. Stability generation IDs are retained in task records. After a timeout or service restart, check your provider account before requesting another paid generation. Refreshing the page restores active task polling and saved work.
 
 ## Storage and sharing
 
@@ -104,3 +104,21 @@ Run the integration tests from the repository root:
 Tests use a temporary database and mocked providers, spending no API credits. They cover image upload and image-bearing DeepSeek requests, prompt editing, loop preparation, numbered naming, rename/download, library persistence, inpainting mask extraction, exactly two variation requests in hybrid mode, three inpaint requests in inpainting-only mode, reference-end exclusion for every mask, partial failure, and idempotency.
 
 The pipeline validates audio readability, duration and finite samples. It cannot guarantee prompt adherence, instrument isolation, compatible harmony, tempo or natural musical transitions. Curator listening remains essential. All audio generation happens before playback; there is no streaming prompt-controlled generation.
+
+## Text encoding on Raspberry Pi and other hosts
+
+The platform reads and writes its text files as UTF-8, including the MP3 export manifest. Update `curator_platform/app.py` and restart the server if an older installation reports a `charmap` encoding error for an arrow or an artwork title.
+
+For an older checkout, Python's UTF-8 mode is a temporary workaround:
+
+```bash
+python -X utf8 -m curator_platform.app --port 7870
+```
+
+An export failure can occur after provider generation has finished. Retained WAV files are in `curator_platform/data/jobs/<job-id>/`; check them before paying to generate the transition again.
+
+## Public access and phones
+
+See [hosting guide](../docs/hosting.md) for the free temporary event link, phone playback, stopping public access, and optional permanent hosting. Public mode must be explicitly enabled; the default launcher remains local.
+
+Concurrency: `CURATOR_MAX_CONCURRENT_JOBS` defaults to `3` (allowed range 1–8). Keep one server process; it uses a thread pool for concurrent jobs.

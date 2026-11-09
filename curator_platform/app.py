@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import io
+import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -16,7 +18,7 @@ import uuid
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -26,15 +28,20 @@ import soundfile as sf
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import audio, providers
+from .hosting import Hosting
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / 'data'
-EXPORT_ROOT = ROOT.parent / 'audio'
+HOSTING = Hosting.from_env(ROOT)
+DATA = HOSTING.data
+EXPORT_ROOT = HOSTING.exports
 LOCK = threading.RLock()
-EXECUTOR = ThreadPoolExecutor(max_workers=1)
+MAX_CONCURRENT_JOBS = int(os.environ.get('CURATOR_MAX_CONCURRENT_JOBS', '3'))
+if not 1 <= MAX_CONCURRENT_JOBS <= 8:
+    raise ValueError('CURATOR_MAX_CONCURRENT_JOBS must be between 1 and 8.')
+EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
 TERMINAL = {'completed', 'failed'}
 app = FastAPI(title="Curator's Gallery", docs_url=None, redoc_url=None)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1', 'testserver'])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(HOSTING.allowed_hosts))
 
 
 def now():
@@ -126,7 +133,7 @@ def initialize(seed=True):
             prompt = ''
             metadata = ROOT.parent/'assets/generated'/('754b73fa-411e-46c2-806d-26a3dcbd94ad.json' if artist.startswith('Giorgio') else 'cb89007a-07e8-4474-97c0-c052795e4105.json')
             if metadata.exists():
-                prompt = json.loads(metadata.read_text()).get('prompt', '')
+                prompt = json.loads(metadata.read_text(encoding='utf-8')).get('prompt', '')
             put('music', {'id': str(uuid.uuid4()), 'name': name, 'artist': artist, 'artwork_title': title,
                 'artwork_id': None, 'filename': 'music/'+destination.name, 'duration': sf.info(destination).duration,
                 'prompt': prompt, 'is_loop': True, 'imported': True, 'created_at': now()})
@@ -139,16 +146,24 @@ def startup():
 
 @app.middleware('http')
 async def local_requests(request: Request, call_next):
+    if request.url.path != '/healthz' and not HOSTING.authorized(request.headers.get('authorization', '')):
+        return JSONResponse({'detail': 'Sign in to the curator workspace.'}, status_code=401,
+                            headers={'WWW-Authenticate': 'Basic realm="Curator workspace", charset="UTF-8"',
+                                     'Cache-Control': 'no-store'})
     if request.method in {'POST', 'PATCH', 'DELETE'}:
-        if request.headers.get('origin') != str(request.base_url).rstrip('/') or request.headers.get('x-curator-request') != '1':
-            return JSONResponse({'detail': 'Please make changes from the local curator workbench.'}, status_code=403)
-        if int(request.headers.get('content-length', '0')) > 15_000_000:
+        if request.headers.get('origin') not in {HOSTING.public_url, str(request.base_url).rstrip('/')} or request.headers.get('x-curator-request') != '1':
+            return JSONResponse({'detail': 'Please make changes from the curator workspace.'}, status_code=403)
+        try:
+            content_length = int(request.headers.get('content-length', '0'))
+        except ValueError:
+            return JSONResponse({'detail': 'Invalid content length.'}, status_code=400)
+        if content_length > 15_000_000:
             return JSONResponse({'detail': 'Upload is too large. Choose an image under 8 MB.'}, status_code=413)
         if len(await request.body()) > 15_000_000:
             return JSONResponse({'detail': 'Request is too large.'}, status_code=413)
     result = await call_next(request)
     result.headers['X-Content-Type-Options'] = 'nosniff'
-    if request.url.path.startswith('/api/'):
+    if request.url.path.startswith(('/api/', '/static/')) or request.url.path == '/':
         result.headers['Cache-Control'] = 'no-store'
     return result
 
@@ -180,7 +195,7 @@ class TaskInput(BaseModel):
     start: float = Field(default=0, ge=0, allow_inf_nan=False)
     end: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     context: float = Field(default=8, ge=1, le=20, allow_inf_nan=False)
-    bridge: float = Field(default=12, ge=4, le=120, allow_inf_nan=False)
+    bridge: float = Field(default=20, ge=4, le=120, allow_inf_nan=False)
     name: str = Field(default='', max_length=150)
     method: Literal['hybrid', 'inpaint'] = 'hybrid'
 
@@ -235,6 +250,11 @@ def create_artwork(body: ArtworkInput):
     result = {'id': key, 'title': body.title, 'artist': body.artist, 'notes': body.notes,
               'image': 'images/'+key+'.jpg', 'prompt': '', 'analysis': None, 'created_at': now()}
     return put('artwork', result)
+
+
+@app.get('/api/artworks')
+def artwork_history():
+    return sorted(records('artwork'), key=lambda x: x['created_at'], reverse=True)
 
 
 @app.get('/api/artworks/{artwork_id}/image')
@@ -329,7 +349,7 @@ def bridge_prompts(a, b, direction=''):
 def do_bridge(job, directory, provider):
     a, b = find('music', job['payload']['a_id']), find('music', job['payload']['b_id'])
     prompts = bridge_prompts(a, b, job['payload']['prompt'])
-    (directory/'prompts.json').write_text(json.dumps(prompts, indent=2))
+    (directory/'prompts.json').write_text(json.dumps(prompts, indent=2), encoding='utf-8')
     plan = audio.prepare_bridge(asset(a['filename']), asset(b['filename']), directory,
                                 job['payload']['context'], job['payload']['bridge'])
     advance(job['id'], 'bridge', 'Generating the bridge from both audio anchors…', 12)
@@ -353,7 +373,7 @@ def export_grid_mp3(grid):
         while destination.exists():
             manifest = destination/'manifest.json'
             try:
-                existing = json.loads(manifest.read_text())
+                existing = json.loads(manifest.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 existing = {}
             if existing.get('grid_id') == grid['id'] and all((destination/f'cell_{i}.mp3').is_file() for i in range(5)):
@@ -376,7 +396,7 @@ def export_grid_mp3(grid):
                       'method': grid.get('method', 'hybrid'), 'created_at': grid['created_at'],
                       'cells': [{'file': f'cell_{i}.mp3', 'label': grid['files'][str(i)]['label'],
                                  'duration': grid['files'][str(i)]['duration']} for i in range(5)]}
-            (staging/'manifest.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+            (staging/'manifest.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
             staging.rename(destination)
         return {'directory': str(destination.relative_to(ROOT.parent)) if destination.is_relative_to(ROOT.parent) else str(destination),
                 'artwork_titles': [title_a, title_b], 'files': [f'cell_{i}.mp3' for i in range(5)]}
@@ -421,7 +441,7 @@ def do_grid(job, directory, provider):
                 'vocals, dramatic build, final cadence or fade to silence. '
                 'This connection sits between '+('artwork A and the curated shared middle.' if index == 1 else 'the curated shared middle and artwork B.')+
                 '\nCurator direction: '+payload.get('prompt', '')[:2000])
-            (child/'plan.json').write_text(json.dumps(plan, indent=2))
+            (child/'plan.json').write_text(json.dumps(plan, indent=2), encoding='utf-8')
             provider.inpaint(plan['path'], plan['prompt'], child/'generated.wav', plan['duration'], plan['start'], plan['end'])
             audio.finish_bridge(child, plan)
             assembled = audio.read(child/'transition.wav')
@@ -451,7 +471,7 @@ def do_grid(job, directory, provider):
             'method': payload.get('method', 'hybrid'),
             'created_at': now(), 'bridge_job_id': payload.get('source_job_id') or job['id']}
     grid['mp3_export'] = export_grid_mp3(grid)
-    (directory/'manifest.json').write_text(json.dumps(grid, indent=2))
+    (directory/'manifest.json').write_text(json.dumps(grid, indent=2), encoding='utf-8')
     put('grid', grid)
     return {'grid_id': grid['id'], 'bridge': result}
 
@@ -523,8 +543,8 @@ def create_task(body: TaskInput):
             raise HTTPException(503, 'Add DEEPSEEK_API_KEY to the root .env to generate a prompt, or write one yourself.')
         if body.kind in {'music', 'bridge', 'grid'} and not availability['stability']:
             raise HTTPException(503, 'Add STABILITY_API_KEY to the root .env to generate audio.')
-        if any(x['status'] not in TERMINAL for x in records('job')):
-            raise HTTPException(409, 'Another task is running. Wait for it to finish before starting this one.')
+        if sum(x['status'] not in TERMINAL for x in records('job')) >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(409, f'All {MAX_CONCURRENT_JOBS} generation slots are busy. Please try again when one finishes.')
         if body.kind in {'prompt', 'music'}:
             if not body.artwork_id:
                 raise HTTPException(422, 'Add the artwork first.')
@@ -604,14 +624,24 @@ def grid_audio(grid_id: uuid.UUID, column: int, download: bool = False):
 app.mount('/static', StaticFiles(directory=ROOT/'web'), name='static')
 
 
+@app.get('/healthz')
+def health():
+    return {'status': 'ok'}
+
+
 @app.get('/')
 def index():
-    return FileResponse(ROOT/'web/index.html', media_type='text/html', headers={'Cache-Control': 'no-cache'})
+    html = (ROOT/'web/index.html').read_text(encoding='utf-8')
+    for name in ['app.js', 'style.css']:
+        version = hashlib.sha256((ROOT/'web'/name).read_bytes()).hexdigest()[:12]
+        html = html.replace(f'/static/{name}', f'/static/{name}?v={version}')
+    return HTMLResponse(html, headers={'Cache-Control': 'no-store'})
 
 
 if __name__ == '__main__':
     import uvicorn
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--port', type=int, default=7870)
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '7870')))
+    parser.add_argument('--host', default='127.0.0.1')
     arguments = parser.parse_args()
-    uvicorn.run(app, host='127.0.0.1', port=arguments.port)
+    uvicorn.run(app, host=arguments.host, port=arguments.port, workers=1)

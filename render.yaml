@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: curators-gallery
+    runtime: docker
+    plan: standard
+    region: frankfurt
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeployTrigger: off
+    disk:
+      name: gallery-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: CURATOR_DATA_DIR
+        value: /var/data/curator
+      - key: CURATOR_EXPORT_DIR
+        value: /var/data/audio
+      - key: CURATOR_USERNAME
+        value: curator
+      - key: CURATOR_PASSWORD
+        generateValue: true
+      - key: STABILITY_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false

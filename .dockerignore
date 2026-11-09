@@ -1,0 +1,10 @@
+**
+!curator_platform/
+!curator_platform/**
+!Dockerfile
+!.dockerignore
+curator_platform/data/
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+**/.env*

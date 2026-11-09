@@ -1,0 +1,37 @@
+{
+  "grid_id": "4ded2bca-bc57-4ef8-af52-ee3f2ea07588",
+  "gallery_name": "Castle, Church and Railway, 1909. → terrace at night",
+  "artwork_titles": [
+    "Castle, Church and Railway, 1909.",
+    "terrace at night"
+  ],
+  "method": "inpaint",
+  "created_at": "2026-10-22T20:32:28.689928+00:00",
+  "cells": [
+    {
+      "file": "cell_0.mp3",
+      "label": "Castle, Church and Railway, 1909.",
+      "duration": 31.0
+    },
+    {
+      "file": "cell_1.mp3",
+      "label": "Toward Castle, Church and Railway, 1909.",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_2.mp3",
+      "label": "Shared middle",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_3.mp3",
+      "label": "Toward terrace at night",
+      "duration": 31.75
+    },
+    {
+      "file": "cell_4.mp3",
+      "label": "terrace at night",
+      "duration": 30.0
+    }
+  ]
+}

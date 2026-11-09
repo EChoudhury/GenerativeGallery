@@ -1,0 +1,37 @@
+{
+  "grid_id": "79a977d6-968b-4fc1-868a-a36d725c550d",
+  "gallery_name": "terrace at night → Mondrian · Boogie Revival",
+  "artwork_titles": [
+    "terrace at night",
+    "Victory Boogie Woogie"
+  ],
+  "method": "inpaint",
+  "created_at": "2026-10-22T08:50:32.651419+00:00",
+  "cells": [
+    {
+      "file": "cell_0.mp3",
+      "label": "terrace at night",
+      "duration": 30.0
+    },
+    {
+      "file": "cell_1.mp3",
+      "label": "Toward terrace at night",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_2.mp3",
+      "label": "Shared middle",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_3.mp3",
+      "label": "Toward Mondrian · Boogie Revival",
+      "duration": 11.75
+    },
+    {
+      "file": "cell_4.mp3",
+      "label": "Mondrian · Boogie Revival",
+      "duration": 29.0
+    }
+  ]
+}
